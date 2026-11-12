@@ -372,3 +372,68 @@ func TestAttemptDeadlineStopsStalledDownload(t *testing.T) {
 		t.Fatal("fail was not posted")
 	}
 }
+
+func TestProgressDeadlineReportsTimeout(t *testing.T) {
+	failed := make(chan []byte, 4)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/progress") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+			return
+		}
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("step"))
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/fail") {
+			w.WriteHeader(http.StatusNoContent)
+			select {
+			case failed <- raw:
+			default:
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	c.fileHTTP = c.coreHTTP
+	c.operation = convert.OperationConvert
+	href := c.core.String() + "/objects"
+	asgn := assignmentJSON{
+		AttemptID:       "attempt",
+		AttemptToken:    "tok",
+		AttemptDeadline: time.Now().Add(300 * time.Millisecond).Format(time.RFC3339Nano),
+		LeaseExpiresAt:  time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		Inputs:          []fileLinkJSON{{Role: "source", Ordinal: 0, Href: href, Format: "step"}},
+		Outputs:         []fileLinkJSON{{Role: "primary", Ordinal: 0, Href: href, Format: "stl"}},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- c.runAssignment(context.Background(), asgn, controlJSON{})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress ignored the deadline")
+	}
+	select {
+	case body := <-failed:
+		if !strings.Contains(string(body), `"engine_code":"timeout"`) {
+			t.Fatalf("fail body %s", body)
+		}
+	default:
+		t.Fatal("fail was not posted")
+	}
+}

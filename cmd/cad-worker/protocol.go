@@ -691,13 +691,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		}
 		return c.fail(ctx, asgn, cadEngineCode(err), safeMessage(err))
 	}
-	if err := c.postProgress(attemptCtx, asgn, 0); err != nil {
-		if done, stopErr := c.alreadyStopped(ctx, &flag); done {
-			return stopErr
-		}
-		if errors.Is(err, errAttemptNotActive) {
-			return c.lostLease(ctx, &flag, asgn)
-		}
+	if err := c.reportProgress(ctx, attemptCtx, &flag, asgn, 0); err != nil {
 		return err
 	}
 
@@ -717,13 +711,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	if measurements != nil && len(measured) == 0 {
 		return c.fail(ctx, asgn, "engine_error", "assignment")
 	}
-	if err := c.postProgress(attemptCtx, asgn, 99); err != nil {
-		if done, stopErr := c.alreadyStopped(ctx, &flag); done {
-			return stopErr
-		}
-		if errors.Is(err, errAttemptNotActive) {
-			return c.lostLease(ctx, &flag, asgn)
-		}
+	if err := c.reportProgress(ctx, attemptCtx, &flag, asgn, 99); err != nil {
 		return err
 	}
 	if err := c.putFile(attemptCtx, out.Href, produced, convert.MIMEType(out.Format)); err != nil {
@@ -1075,6 +1063,23 @@ func (c *protocolClient) renew(ctx context.Context, asgn assignmentJSON) (time.T
 type progressJSON struct {
 	ProtocolVersion int `json:"protocol_version"`
 	Percent         int `json:"percent"`
+}
+
+func (c *protocolClient) reportProgress(ctx, attemptCtx context.Context, flag *stopFlag, asgn assignmentJSON, percent int) error {
+	err := c.postProgress(attemptCtx, asgn, percent)
+	if err == nil {
+		return nil
+	}
+	if done, stopErr := c.alreadyStopped(ctx, flag); done {
+		return stopErr
+	}
+	if errors.Is(err, errAttemptNotActive) {
+		return c.lostLease(ctx, flag, asgn)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return c.fail(ctx, asgn, cadEngineCode(err), safeMessage(err))
+	}
+	return err
 }
 
 func (c *protocolClient) postProgress(ctx context.Context, asgn assignmentJSON, percent int) error {
