@@ -1,0 +1,711 @@
+#!/opt/venv/bin/python -IB
+import argparse
+import json
+import mmap
+import os
+import re
+import sys
+
+FINITE_LIMIT = 1e12
+QUALITY = {"draft": (0.004, 0.5), "standard": (0.001, 0.35), "fine": (0.0003, 0.2)}
+MM_PER_UNIT = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "inch": 25.4, "foot": 304.8, "micrometre": 0.001}
+UNIT_NAMES = {
+    "millimetre": "mm", "millimeter": "mm", "mm": "mm", "milli_metre": "mm",
+    "centimetre": "cm", "centimeter": "cm", "cm": "cm", "centi_metre": "cm",
+    "metre": "m", "meter": "m", "m": "m",
+    "inch": "inch", "in": "inch",
+    "foot": "foot", "feet": "foot", "ft": "foot",
+    "micrometre": "micrometre", "micrometer": "micrometre", "micron": "micrometre",
+    "micro_metre": "micrometre",
+}
+SI_PREFIX = {"MILLI": "mm", "CENTI": "cm", "MICRO": "micrometre", "": "m"}
+IGES_FLAG = {1: "inch", 2: "mm", 4: "foot", 6: "m", 9: "micrometre", 10: "cm"}
+GUAC_RE = re.compile(rb"GLOBAL_UNIT_ASSIGNED_CONTEXT\s*\(\s*\(([^)]*)\)\s*\)")
+SI_RE = re.compile(rb"SI_UNIT\s*\(\s*(?:\.([A-Z]+)\.|\$)\s*,\s*\.METRE\.\s*\)")
+CONV_RE = re.compile(rb"CONVERSION_BASED_UNIT\s*\(\s*'([^']*)'")
+IGES_GLOBAL_LINES = 4096
+STL_CHUNK = 1000000
+ASCII_BLOCK = 1 << 25
+VERTEX_RE = re.compile(rb"vertex\s+(\S+)\s+(\S+)\s+(\S+)", re.IGNORECASE)
+VERTEX_KEY_RE = re.compile(rb"vertex", re.IGNORECASE)
+KEYWORD_WINDOW = 1 << 20
+NORMALIZED_HEADER = b"octoconv normalized binary stl".ljust(80, b"\0")
+STL_WRITE_CHUNK = 1 << 16
+STL_RECORD = [("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")]
+EXIT_UNREADABLE = 2
+EXIT_EMPTY = 3
+EXIT_TOO_COMPLEX = 4
+EXIT_USAGE = 64
+NOT_EVALUATED = -1
+NUMERIC_FAIL_MARKERS = ("not a Real", "not an Integer")
+MESH_FAILURE_FLAGS = ("OpenWire", "SelfIntersectingWire", "Failure", "UnorientedWire", "TooFewPoints", "UserBreak")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write("cad-mesh: %s\n" % message)
+        sys.exit(EXIT_USAGE)
+
+
+def box_diag(box):
+    lo, hi = box.CornerMin(), box.CornerMax()
+    return ((hi.X() - lo.X()) ** 2 + (hi.Y() - lo.Y()) ** 2 + (hi.Z() - lo.Z()) ** 2) ** 0.5
+
+
+def verdict(fd, verdict_name, reason, triangles=0, load_fails=NOT_EVALUATED):
+    obj = {"stage": "mesh", "verdict": verdict_name, "reason": reason, "triangles": triangles, "load_fails": load_fails}
+    os.write(fd, ("CADVERDICT " + json.dumps(obj, separators=(",", ":"), sort_keys=True) + "\n").encode("ascii"))
+
+
+def finite_box(shape):
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.Bnd import Bnd_Box
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+
+    box = Bnd_Box()
+    BRepBndLib.Add_s(shape, box)
+    if not box.IsVoid() and box_diag(box) <= FINITE_LIMIT:
+        return box
+    box = Bnd_Box()
+    faces = TopExp_Explorer(shape, TopAbs_FACE)
+    while faces.More():
+        fbox = Bnd_Box()
+        BRepBndLib.AddOptimal_s(faces.Current(), fbox, False, False)
+        if not fbox.IsVoid() and box_diag(fbox) <= FINITE_LIMIT:
+            box.Add(fbox)
+        faces.Next()
+    return box
+
+
+def mesh_failure_mask():
+    from OCP.IMeshData import IMeshData_Status
+
+    mask = 0
+    for name in MESH_FAILURE_FLAGS:
+        mask |= getattr(IMeshData_Status, "IMeshData_" + name).value
+    return mask
+
+
+def face_survey(shape):
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    faces = meshed = triangles = 0
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        faces += 1
+        triangulation = BRep_Tool.Triangulation_s(TopoDS.Face(explorer.Current()), TopLoc_Location())
+        if triangulation is not None and triangulation.NbTriangles() > 0:
+            meshed += 1
+            triangles += triangulation.NbTriangles()
+        explorer.Next()
+    return faces, meshed, triangles
+
+
+def load_check(reader):
+    checks = reader.WS().ModelCheckList(False)
+    fails = 0
+    numeric = 0
+    checks.Start()
+    while checks.More():
+        check = checks.Value()
+        fails += check.NbFails()
+        for i in range(1, check.NbFails() + 1):
+            text = check.Fail(i).ToCString()
+            if any(marker in text for marker in NUMERIC_FAIL_MARKERS):
+                numeric += 1
+        checks.Next()
+    return fails, numeric
+
+
+def normalize_unit(name):
+    key = re.sub(r"[^a-z_]", "", (name or "").strip().lower().replace(" ", "_"))
+    return UNIT_NAMES.get(key, "")
+
+
+def length_unit_of(mm_map, ref):
+    pat = re.compile(rb"(?<![0-9A-Za-z])#" + ref + rb"\s*=\s*([^;]*);")
+    m = pat.search(mm_map)
+    if not m or b"LENGTH_UNIT" not in m.group(1):
+        return None
+    body = m.group(1)
+    conv = CONV_RE.search(body)
+    if conv:
+        name = conv.group(1).decode("latin-1")
+        return normalize_unit(name), name
+    si = SI_RE.search(body)
+    if si:
+        prefix = (si.group(1) or b"").decode("ascii")
+        if prefix in SI_PREFIX:
+            return SI_PREFIX[prefix], prefix.lower() + "metre"
+        return "", prefix.lower() + "metre"
+    return "", "unknown"
+
+
+def step_declared(path):
+    seen = []
+    contexts = 0
+    with open(path, "rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            for m in GUAC_RE.finditer(mm):
+                contexts += 1
+                for ref in re.findall(rb"#(\d+)", m.group(1)):
+                    found = length_unit_of(mm, ref)
+                    if found is not None:
+                        seen.append(found)
+                        break
+                if contexts >= 8:
+                    break
+    if contexts == 0:
+        return "", ""
+    if not seen:
+        return "", "unknown"
+    if len({unit or raw for unit, raw in seen}) > 1:
+        return "", "mixed"
+    return seen[0][0], "" if seen[0][0] else seen[0][1]
+
+
+def iges_params(text):
+    out = []
+    delim = ","
+    pos = 0
+    if text.startswith(","):
+        out.append("")
+        pos = 1
+    else:
+        m = re.match(r"1H(.)", text)
+        if not m:
+            return out
+        delim = m.group(1)
+        out.append(delim)
+        pos = m.end()
+        if text[pos:pos + 1] == delim:
+            pos += 1
+    while pos < len(text) and len(out) < 20:
+        m = re.match(r"(\d+)H", text[pos:])
+        if m:
+            n = int(m.group(1))
+            start = pos + m.end()
+            out.append(text[start:start + n])
+            pos = start + n
+        else:
+            end = pos
+            while end < len(text) and text[end] not in (delim, ";"):
+                end += 1
+            out.append(text[pos:end].strip())
+            pos = end
+        if text[pos:pos + 1] == ";":
+            break
+        if text[pos:pos + 1] == delim:
+            pos += 1
+    return out
+
+
+def iges_global_text(path):
+    lines = []
+    with open(path, "rb") as fh:
+        head = fh.read(400)
+        fh.seek(0)
+        if b"\n" in head or b"\r" in head:
+            records = (raw.rstrip(b"\r\n") for raw in fh)
+        else:
+            records = iter(lambda: fh.read(80), b"")
+        for rec in records:
+            if not rec.strip():
+                continue
+            if len(rec) >= 73 and rec[72:73] == b"G":
+                lines.append(rec[:72].decode("latin-1"))
+                if len(lines) > IGES_GLOBAL_LINES:
+                    break
+            elif lines:
+                break
+    return "".join(lines)
+
+
+def iges_declared(path):
+    params = iges_params(iges_global_text(path))
+    flag = None
+    name = ""
+    if len(params) >= 14:
+        try:
+            flag = int(params[13])
+        except ValueError:
+            flag = None
+    if len(params) >= 15:
+        name = params[14]
+    if flag is None:
+        return "", ""
+    if flag == 3:
+        unit = normalize_unit(name)
+        return (unit, "") if unit else ("", name or "unknown")
+    if flag in IGES_FLAG:
+        return IGES_FLAG[flag], ""
+    return "", "flag %d" % flag
+
+
+def applied_factor(fmt, unit, raw):
+    if unit == "" and raw == "":
+        return 1.0
+    if unit == "":
+        return None
+    if fmt == "iges" and unit != "mm":
+        return None
+    return MM_PER_UNIT[unit]
+
+
+def solid_summary(shape):
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.TopAbs import TopAbs_SHELL, TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+
+    solids = closed = open_solids = 0
+    volume = area = 0.0
+    negative = False
+    explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+    while explorer.More():
+        solid = explorer.Current()
+        solids += 1
+        shells_closed = True
+        shells = TopExp_Explorer(solid, TopAbs_SHELL)
+        while shells.More():
+            shells_closed = shells_closed and BRep_Tool.IsClosed_s(shells.Current())
+            shells.Next()
+        if not shells_closed:
+            open_solids += 1
+        elif BRepCheck_Analyzer(solid).IsValid():
+            closed += 1
+            props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(solid, props)
+            mass = props.Mass()
+            volume += mass
+            if mass < 0:
+                negative = True
+            sprops = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(solid, sprops)
+            area += sprops.Mass()
+        explorer.Next()
+    if closed and (volume == 0 or volume != volume or abs(volume) == float("inf") or area != area or abs(area) == float("inf")):
+        closed = 0
+    reason = ""
+    vol_out = area_out = None
+    if closed == 0:
+        if solids == 0:
+            reason = "no_solids"
+        elif open_solids:
+            reason = "open_shell"
+        else:
+            reason = "invalid_solid"
+    elif negative:
+        reason = "negative_volume"
+    else:
+        vol_out, area_out = volume, area
+    return solids, closed, vol_out, area_out, reason
+
+
+def document_box(shape):
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.Bnd import Bnd_Box
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+
+    box = Bnd_Box()
+    BRepBndLib.AddOptimal_s(shape, box, False, False)
+    if box.IsVoid() or box_diag(box) > FINITE_LIMIT:
+        box = Bnd_Box()
+        faces = TopExp_Explorer(shape, TopAbs_FACE)
+        while faces.More():
+            fbox = Bnd_Box()
+            BRepBndLib.AddOptimal_s(faces.Current(), fbox, False, False)
+            if not fbox.IsVoid() and box_diag(fbox) <= FINITE_LIMIT:
+                box.Add(fbox)
+            faces.Next()
+    if box.IsVoid():
+        raise ValueError("empty bounding box")
+    lo, hi = box.CornerMin(), box.CornerMax()
+    return [lo.X(), lo.Y(), lo.Z()], [hi.X(), hi.Y(), hi.Z()]
+
+
+def write_draft(path, draft):
+    text = json.dumps(draft, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def measure_draft(fmt, src, shape, triangles):
+    solids, closed, volume, area, reason = solid_summary(shape)
+    lo, hi = document_box(shape)
+    unit, raw = iges_declared(src) if fmt == "iges" else step_declared(src)
+    if unit == "" and raw != "":
+        sys.stderr.write("cad-mesh: unit text not in vocabulary: %s\n" % raw)
+    return {
+        "format": fmt,
+        "declared_unit": unit,
+        "declared_unit_raw": raw,
+        "applied_factor": applied_factor(fmt, unit, raw),
+        "bbox": {"min": lo, "max": hi},
+        "solids": solids,
+        "closed_solids": closed,
+        "volume": volume,
+        "area": area,
+        "null_reason": reason,
+        "triangles": triangles,
+    }
+
+
+def run(fmt, src, out, fd, quality, measure):
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.IGESControl import IGESControl_Reader
+    from OCP.Interface import Interface_Static
+    from OCP.STEPControl import STEPControl_Reader
+    from OCP.StlAPI import StlAPI_Writer
+
+    reader = IGESControl_Reader() if fmt == "iges" else STEPControl_Reader()
+    if not Interface_Static.SetCVal_s("xstep.cascade.unit", "MM"):
+        sys.stderr.write("cad-mesh: cannot pin xstep.cascade.unit\n")
+        return 1
+    fails = NOT_EVALUATED
+    try:
+        if reader.ReadFile(src) != IFSelect_RetDone:
+            verdict(fd, "unreadable", "read_failed", load_fails=fails)
+            return EXIT_UNREADABLE
+        fails, numeric = load_check(reader)
+        if numeric > 0:
+            verdict(fd, "unreadable", "load_check_fail", load_fails=fails)
+            return EXIT_UNREADABLE
+        reader.TransferRoots()
+        shape = reader.OneShape()
+        if shape.IsNull():
+            verdict(fd, "unreadable", "no_shape", load_fails=fails)
+            return EXIT_UNREADABLE
+
+        box = finite_box(shape)
+        if box.IsVoid():
+            verdict(fd, "empty", "empty_bbox", load_fails=fails)
+            return EXIT_EMPTY
+        diag = box_diag(box)
+        if diag <= 0:
+            verdict(fd, "empty", "zero_size", load_fails=fails)
+            return EXIT_EMPTY
+
+        linear, angular = QUALITY[quality]
+        mesher = BRepMesh_IncrementalMesh(shape, linear * diag, False, angular, False)
+        flags = mesher.GetStatusFlags()
+        faces, meshed, expected = face_survey(shape)
+        if meshed == 0:
+            verdict(fd, "empty", "no_triangles", load_fails=fails)
+            return EXIT_EMPTY
+        if not mesher.IsDone() or flags & mesh_failure_mask():
+            sys.stderr.write("cad-mesh: mesher done=%s flags=%d faces=%d meshed=%d\n" % (mesher.IsDone(), flags, faces, meshed))
+            verdict(fd, "incomplete", "mesh_status", load_fails=fails)
+            return EXIT_UNREADABLE
+        if meshed != faces:
+            sys.stderr.write("cad-mesh: faces=%d meshed=%d\n" % (faces, meshed))
+            verdict(fd, "incomplete", "face_not_triangulated", load_fails=fails)
+            return EXIT_UNREADABLE
+        writer = StlAPI_Writer()
+        writer.ASCIIMode = False
+        if not writer.Write(shape, out):
+            verdict(fd, "empty", "write_failed", load_fails=fails)
+            return EXIT_EMPTY
+        size = os.path.getsize(out)
+        triangles = (size - 84) // 50
+        if triangles <= 0:
+            verdict(fd, "empty", "no_triangles", load_fails=fails)
+            return EXIT_EMPTY
+        if size != 84 + 50 * triangles or triangles != expected:
+            sys.stderr.write("cad-mesh: stl bytes=%d triangles=%d mesh triangles=%d\n" % (size, triangles, expected))
+            verdict(fd, "incomplete", "stl_count_mismatch", load_fails=fails)
+            return EXIT_UNREADABLE
+        if measure:
+            try:
+                write_draft(measure, measure_draft(fmt, src, shape, triangles))
+            except Exception as exc:
+                sys.stderr.write("cad-mesh: measure: %s: %s\n" % (exc.__class__.__name__, exc))
+                verdict(fd, "unreadable", "measure_failed", load_fails=fails)
+                return EXIT_UNREADABLE
+        verdict(fd, "ok", "", triangles, fails)
+        return 0
+    except MemoryError:
+        verdict(fd, "too_complex", "out_of_memory", load_fails=fails)
+        return EXIT_TOO_COMPLEX
+    except Exception as exc:
+        sys.stderr.write("cad-mesh: %s: %s\n" % (exc.__class__.__name__, exc))
+        verdict(fd, "unreadable", "reader_exception", load_fails=fails)
+        return EXIT_UNREADABLE
+
+
+def last_keyword(data):
+    pos = len(data)
+    while pos > 0:
+        lo = max(0, pos - KEYWORD_WINDOW)
+        last = -1
+        for m in VERTEX_KEY_RE.finditer(data, lo, min(len(data), pos + 5)):
+            last = m.start()
+        if last >= 0:
+            return last
+        pos = lo
+    return -1
+
+
+def stats_write(out, vertices):
+    import numpy as np
+
+    record = np.dtype(STL_RECORD)
+    total = len(vertices) // 3
+    with open(out, "wb") as fh:
+        fh.write(NORMALIZED_HEADER)
+        fh.write(total.to_bytes(4, "little"))
+        for start in range(0, total, STL_WRITE_CHUNK):
+            with np.errstate(over="ignore"):
+                tri = vertices[start * 3:(start + STL_WRITE_CHUNK) * 3].astype(np.float32).reshape(-1, 3, 3)
+            if not np.isfinite(tri).all():
+                return False
+            chunk = np.zeros(len(tri), dtype=record)
+            chunk["v"] = tri
+            del tri
+            fh.write(chunk.tobytes())
+            del chunk
+    return os.path.getsize(out) == 84 + 50 * total
+
+
+def stats_discard(out):
+    try:
+        os.remove(out)
+    except FileNotFoundError:
+        pass
+
+
+def stats_read(src):
+    import numpy as np
+
+    size = os.path.getsize(src)
+    if size >= 84:
+        with open(src, "rb") as fh:
+            fh.seek(80)
+            count = int.from_bytes(fh.read(4), "little")
+        if size == 84 + 50 * count:
+            if count == 0:
+                return None, True
+            record = np.dtype(STL_RECORD)
+            mapped = np.memmap(src, dtype=record, mode="r", offset=84, shape=(count,))
+            vertices = np.ascontiguousarray(mapped["v"]).reshape(-1, 3)
+            del mapped
+            return vertices, True
+    parts = []
+    carry = b""
+    with open(src, "rb") as fh:
+        while True:
+            block = fh.read(ASCII_BLOCK)
+            data = carry + block
+            if block:
+                cut = last_keyword(data)
+                if cut <= 0:
+                    carry = data
+                    continue
+                carry = data[cut:]
+                data = data[:cut]
+            found = VERTEX_RE.findall(data)
+            if found:
+                parts.append(np.array(found, dtype=np.float64))
+            if not block:
+                break
+    if not parts:
+        return None, False
+    vertices = np.concatenate(parts)
+    if len(vertices) % 3:
+        return None, False
+    return vertices, False
+
+
+def stats_mass(vertices):
+    import numpy as np
+
+    area = 0.0
+    total = len(vertices) // 3
+    vol = np.empty(total, dtype=np.float64)
+    for start in range(0, total, STL_CHUNK):
+        tri = vertices[start * 3:(start + STL_CHUNK) * 3].reshape(-1, 3, 3).astype(np.float64)
+        vol[start:start + len(tri)] = np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2]))
+        area += 0.5 * float(np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1).sum())
+        del tri
+    return vol, area
+
+
+def stats_index(vertices):
+    import numpy as np
+
+    order = np.lexsort((vertices[:, 2], vertices[:, 1], vertices[:, 0]))
+    ordered = vertices[order]
+    group = np.empty(len(ordered), dtype=np.int64)
+    group[0] = 0
+    np.cumsum(np.any(ordered[1:] != ordered[:-1], axis=1), out=group[1:])
+    del ordered
+    index = np.empty(len(group), dtype=np.int64)
+    index[order] = group
+    return index, int(group[-1]) + 1
+
+
+def stats_edges(index, nv):
+    import numpy as np
+
+    tail = index.reshape(-1, 3)[:, [1, 2, 0]].reshape(-1)
+    if (index == tail).any():
+        return None
+    forward = index * nv + tail
+    backward = tail * nv + index
+    del tail
+    forder = np.argsort(forward)
+    fsorted = forward[forder]
+    del forward
+    if len(fsorted) > 1 and (fsorted[1:] == fsorted[:-1]).any():
+        return None
+    border = np.argsort(backward)
+    bsorted = backward[border]
+    del backward
+    same = np.array_equal(fsorted, bsorted)
+    del bsorted
+    if not same:
+        return None
+    half = (fsorted // nv) < (fsorted % nv)
+    del fsorted
+    a = forder[half] // 3
+    del forder
+    b = border[half] // 3
+    del border, half
+    return a, b
+
+
+def stats_union(n, a, b):
+    import numpy as np
+
+    parent = np.arange(n, dtype=np.int64)
+    rounds = 0
+    while True:
+        pa = parent[a]
+        pb = parent[b]
+        lo = np.minimum(pa, pb)
+        hi = np.maximum(pa, pb)
+        del pa, pb
+        mask = lo != hi
+        if not mask.any():
+            break
+        rounds += 1
+        np.minimum.at(parent, hi[mask], lo[mask])
+        del lo, hi, mask
+        while True:
+            jumped = parent[parent]
+            if np.array_equal(jumped, parent):
+                break
+            parent = jumped
+    return parent, rounds
+
+
+def stats_shells(vol, root):
+    import numpy as np
+
+    sums = np.bincount(root, weights=vol, minlength=len(root))
+    return sums[root == np.arange(len(root))] / 6.0
+
+
+def stats(src, out, measure, fd):
+    import numpy as np
+
+    vertices, _ = stats_read(src)
+    if vertices is None:
+        verdict(fd, "unreadable", "stl_malformed")
+        return EXIT_UNREADABLE
+    triangles = len(vertices) // 3
+    lo = vertices.min(axis=0).astype(np.float64)
+    hi = vertices.max(axis=0).astype(np.float64)
+    if not (np.isfinite(lo).all() and np.isfinite(hi).all()):
+        verdict(fd, "unreadable", "stl_malformed")
+        return EXIT_UNREADABLE
+    try:
+        written = stats_write(out, vertices)
+    except BaseException:
+        stats_discard(out)
+        raise
+    if not written:
+        stats_discard(out)
+        verdict(fd, "unreadable", "stl_malformed")
+        return EXIT_UNREADABLE
+    vol, area = stats_mass(vertices)
+    index, nv = stats_index(vertices)
+    del vertices
+    pairs = stats_edges(index, nv)
+    del index
+    reason = ""
+    vol_out = area_out = None
+    if pairs is None:
+        reason = "stl_not_watertight"
+    else:
+        root, _ = stats_union(triangles, *pairs)
+        del pairs
+        shells = stats_shells(vol, root)
+        del root, vol
+        total = float(shells.sum())
+        if total != total or abs(total) == float("inf") or area != area or abs(area) == float("inf") or total == 0 or not np.isfinite(shells).all() or (shells == 0).any():
+            reason = "invalid_solid"
+        elif (shells > 0).all():
+            vol_out, area_out = total, area
+        elif (shells < 0).all():
+            reason = "negative_volume"
+        else:
+            reason = "stl_ambiguous_shells"
+    write_draft(measure, {
+        "format": "stl",
+        "declared_unit": "",
+        "declared_unit_raw": "",
+        "applied_factor": None,
+        "bbox": {"min": [float(x) for x in lo], "max": [float(x) for x in hi]},
+        "solids": None,
+        "closed_solids": None,
+        "volume": vol_out,
+        "area": area_out,
+        "null_reason": reason,
+        "triangles": triangles,
+    })
+    verdict(fd, "ok", "", triangles)
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "stats":
+        ap = Parser(prog="cad-mesh stats", add_help=False)
+        ap.add_argument("--measure", required=True)
+        ap.add_argument("src")
+        ap.add_argument("out")
+        args = ap.parse_args(sys.argv[2:])
+        fd = os.dup(1)
+        os.dup2(2, 1)
+        try:
+            return stats(args.src, args.out, args.measure, fd)
+        except MemoryError:
+            verdict(fd, "too_complex", "out_of_memory")
+            return EXIT_TOO_COMPLEX
+        except Exception as exc:
+            sys.stderr.write("cad-mesh: %s: %s\n" % (exc.__class__.__name__, exc))
+            verdict(fd, "unreadable", "stl_malformed")
+            return EXIT_UNREADABLE
+    ap = Parser(prog="cad-mesh", add_help=False)
+    ap.add_argument("--format", required=True, choices=("step", "iges"))
+    ap.add_argument("--quality", choices=sorted(QUALITY), default="standard")
+    ap.add_argument("--measure", default="")
+    ap.add_argument("src")
+    ap.add_argument("out")
+    args = ap.parse_args()
+    fd = os.dup(1)
+    os.dup2(2, 1)
+    return run(args.format, args.src, args.out, fd, args.quality, args.measure)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
