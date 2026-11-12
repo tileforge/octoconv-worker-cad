@@ -1,0 +1,551 @@
+#!/opt/venv/bin/python -IB
+import argparse
+import io
+import json
+import math
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+COORDINATE_SPACE = 10000
+PAGE_LONG_MM = 297.0
+PAGE_MARGIN_MM = 10.0
+ASPECT_CLAMP = 1000.0
+HATCH_TIMEOUT_S = 30.0
+HATCH_TIMEOUT_MESSAGE = "hatching timeout of"
+TEXT_AS_OUTLINE = False
+AUDIT_BLOCK_CYCLE = 104
+INFINITE_LINES = ("XLINE", "RAY")
+INSUNITS_NAMES = {1: "inch", 2: "foot", 4: "mm", 5: "cm", 6: "m", 13: "micrometre"}
+SKIP_TYPES = frozenset({
+    "IMAGE", "IMAGEDEF", "PDFUNDERLAY", "DWFUNDERLAY", "DGNUNDERLAY", "OLE2FRAME", "OLEFRAME",
+    "3DSOLID", "BODY", "REGION", "SURFACE", "ACAD_PROXY_ENTITY",
+})
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+CSS_STRETCH = {
+    1: "ultra-condensed", 2: "extra-condensed", 3: "condensed", 4: "semi-condensed",
+    6: "semi-expanded", 7: "expanded", 8: "extra-expanded", 9: "ultra-expanded",
+}
+FS_ITALIC = 0x0001
+FS_OBLIQUE = 0x0200
+MAC_ITALIC = 0x0002
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_UNREADABLE = 2
+EXIT_EMPTY = 3
+EXIT_TOO_COMPLEX = 4
+EXIT_USAGE = 64
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write("cad-dxf: %s\n" % message)
+        sys.exit(EXIT_USAGE)
+
+
+class Outcome(Exception):
+    def __init__(self, verdict, reason, code):
+        super().__init__(reason)
+        self.verdict = verdict
+        self.reason = reason
+        self.code = code
+
+
+class FontUnavailable(Exception):
+    pass
+
+
+class DrawnOverCap(Exception):
+    pass
+
+
+def xml_char_ok(c):
+    o = ord(c)
+    return (
+        c in "\t\n\r"
+        or 0x20 <= o <= 0xD7FF
+        or 0xE000 <= o <= 0xFFFD
+        or 0x10000 <= o <= 0x10FFFF
+    )
+
+
+def xml_safe(text):
+    return "".join(c if xml_char_ok(c) else "�" for c in text)
+
+
+def font_attrs(font):
+    names = font["name"]
+    family = names.getDebugName(16) or names.getDebugName(1) or ""
+    subfamily = names.getDebugName(17) or names.getDebugName(2) or ""
+    weight, width, selection = 400, 5, 0
+    if "OS/2" in font:
+        os2 = font["OS/2"]
+        weight, width, selection = os2.usWeightClass, os2.usWidthClass, os2.fsSelection
+    attrs = []
+    css_weight = min(max(int(weight / 100.0 + 0.5) * 100, 100), 900)
+    if css_weight == 700:
+        attrs.append(("font-weight", "bold"))
+    elif css_weight != 400:
+        attrs.append(("font-weight", str(css_weight)))
+    sub = subfamily.lower()
+    if "oblique" in sub:
+        attrs.append(("font-style", "oblique"))
+    elif "italic" in sub or "kursiv" in sub:
+        attrs.append(("font-style", "italic"))
+    elif "OS/2" in font and selection & FS_OBLIQUE:
+        attrs.append(("font-style", "oblique"))
+    elif "OS/2" in font and selection & FS_ITALIC:
+        attrs.append(("font-style", "italic"))
+    elif "OS/2" not in font and font["head"].macStyle & MAC_ITALIC:
+        attrs.append(("font-style", "italic"))
+    if width in CSS_STRETCH:
+        attrs.append(("font-stretch", CSS_STRETCH[width]))
+    return family, tuple(attrs)
+
+
+def new_state():
+    return {
+        "texts": 0,
+        "uncovered": 0,
+        "render_substituted": 0,
+        "hatch_truncated": 0,
+        "entities_drawn": 0,
+        "page_w_mm": 0.0,
+        "page_h_mm": 0.0,
+        "auditor_fixes": 0,
+        "insunits": None,
+        "codepage": None,
+        "skipped": {},
+    }
+
+
+def write_verdict(fd, state, verdict, reason):
+    obj = dict(state)
+    obj.update(stage="dxf", verdict=verdict, reason=reason)
+    line = "CADVERDICT " + json.dumps(obj, separators=(",", ":"), sort_keys=True, ensure_ascii=True) + "\n"
+    os.write(fd, line.encode("ascii"))
+
+
+def read_document(src, state):
+    try:
+        import ezdxf
+    except Exception as exc:
+        sys.stderr.write("cad-dxf: import: %s: %s\n" % (exc.__class__.__name__, exc))
+        raise Outcome("failed", "import_error", EXIT_FAILED)
+    try:
+        doc = ezdxf.readfile(src)
+    except RecursionError:
+        raise Outcome("too_complex", "recursion", EXIT_TOO_COMPLEX)
+    except MemoryError:
+        raise Outcome("too_complex", "out_of_memory", EXIT_TOO_COMPLEX)
+    except Exception as exc:
+        sys.stderr.write("cad-dxf: read: %s: %s\n" % (exc.__class__.__name__, exc))
+        raise Outcome("unreadable", "read_error", EXIT_UNREADABLE)
+    try:
+        auditor = doc.audit()
+    except RecursionError:
+        raise Outcome("too_complex", "recursion", EXIT_TOO_COMPLEX)
+    except MemoryError:
+        raise Outcome("too_complex", "out_of_memory", EXIT_TOO_COMPLEX)
+    except Exception as exc:
+        sys.stderr.write("cad-dxf: audit: %s: %s\n" % (exc.__class__.__name__, exc))
+        raise Outcome("unreadable", "audit_error", EXIT_UNREADABLE)
+    state["auditor_fixes"] = len(auditor.fixes)
+    insunits = doc.header.get("$INSUNITS", None)
+    state["insunits"] = insunits if isinstance(insunits, int) and not isinstance(insunits, bool) else None
+    codepage = doc.header.get("$DWGCODEPAGE", None)
+    state["codepage"] = codepage if isinstance(codepage, str) else None
+    codes = [e.code for e in auditor.errors]
+    if AUDIT_BLOCK_CYCLE in codes:
+        raise Outcome("too_complex", "block_cycle", EXIT_TOO_COMPLEX)
+    if codes:
+        sys.stderr.write("cad-dxf: audit errors: %s\n" % ",".join(str(c) for c in sorted(set(codes))))
+        raise Outcome("unreadable", "audit_error", EXIT_UNREADABLE)
+    return doc
+
+
+def declared_unit(code):
+    if code is None or code == 0:
+        return "", ""
+    name = INSUNITS_NAMES.get(code)
+    if name is not None:
+        return name, ""
+    return "", str(code)
+
+
+def measure_draft(state, bbox):
+    unit, raw = declared_unit(state["insunits"])
+    lo, hi = bbox
+    return {
+        "format": "dxf",
+        "declared_unit": unit,
+        "declared_unit_raw": raw,
+        "applied_factor": 1,
+        "bbox": {"min": [float(lo[0]), float(lo[1])], "max": [float(hi[0]), float(hi[1])]},
+        "solids": None,
+        "closed_solids": None,
+        "volume": None,
+        "area": None,
+        "null_reason": "not_applicable_2d",
+        "triangles": 0,
+    }
+
+
+def padded_frame(frame, BoundingBox2d):
+    w = frame.size.x
+    h = frame.size.y
+    if not (math.isfinite(w) and math.isfinite(h)):
+        raise ValueError("non-finite drawing extents")
+    long_side = max(w, h)
+    w = max(w, long_side / ASPECT_CLAMP)
+    h = max(h, long_side / ASPECT_CLAMP)
+    cx, cy = frame.center.x, frame.center.y
+    return BoundingBox2d([(cx - w / 2.0, cy - h / 2.0), (cx + w / 2.0, cy + h / 2.0)]), w, h
+
+
+def draw(doc, max_drawn, state):
+    from ezdxf.addons.drawing import Frontend, RenderContext, config, layout, svg
+    from ezdxf.addons.drawing.frontend import UniversalFrontend
+    from ezdxf.addons.drawing.pipeline import RenderPipeline2d, prepare_string_for_rendering
+    from ezdxf.entities.acad_table import AcadTableBlockContent
+    from ezdxf.entities.dxfentity import DXFTagStorage
+    from ezdxf.math import BoundingBox2d, Matrix44, Vec2
+    from ezdxf.math.clipping import ClippingRect2d
+
+    texts = []
+    infinite = []
+    ink = [0]
+    cmaps = {}
+    faces = {}
+    skipped = state["skipped"]
+
+    def skip_kind(entity):
+        kind = entity.dxftype()
+        if kind in SKIP_TYPES or kind.endswith("SURFACE"):
+            return kind
+        if kind == "INSERT":
+            layout_ = doc.blocks.get(entity.dxf.get("name", ""))
+            block = None if layout_ is None else layout_.block
+            if block is None or block.is_xref or block.is_xref_overlay:
+                return "XREF"
+            return None
+        if isinstance(entity, DXFTagStorage) and not isinstance(entity, AcadTableBlockContent):
+            return "PROXY:" + kind
+        return None
+
+    def keep(entity):
+        kind = skip_kind(entity)
+        if kind is None:
+            return True
+        skipped[kind] = skipped.get(kind, 0) + 1
+        return False
+
+    class TextPipeline(RenderPipeline2d):
+        run_alpha = ""
+
+        def get_backend_properties(self, properties):
+            bp = RenderPipeline2d.get_backend_properties(self, properties)
+            if self.run_alpha and len(bp.color) == 7:
+                return bp._replace(color=bp.color + self.run_alpha)
+            return bp
+
+        def draw_text(self, text, transform, properties, cap_height, dxftype="TEXT"):
+            if not text.strip():
+                return
+            text = xml_safe(prepare_string_for_rendering(xml_safe(text), dxftype))
+            face = properties.font
+            if face is None:
+                face = self.default_font_face
+            gc = getattr(self.text_engine.get_font(face), "glyph_cache", None)
+            if gc is None or not hasattr(gc, "font"):
+                raise FontUnavailable(dxftype)
+            f = gc.get_scaling_factor(cap_height)
+            box = BoundingBox2d()
+            for p in self.text_engine.get_text_glyph_paths(text, face, cap_height):
+                p.transform_inplace(transform)
+                if len(p):
+                    box.extend(p.extents())
+            fonts = faces.get(id(gc.font))
+            if fonts is None:
+                fonts = faces[id(gc.font)] = font_attrs(gc.font)
+            cmap = cmaps.get(id(gc.font))
+            if cmap is None:
+                cmap = cmaps[id(gc.font)] = gc.font.getBestCmap() or {}
+            texts.append({
+                "text": text,
+                "covered": "".join(c for c in text if ord(c) in cmap),
+                "render": "".join(c if ord(c) in cmap else "\ufffd" for c in text),
+                "m": Matrix44(transform),
+                "em": gc.font["head"].unitsPerEm * f,
+                "shift": -gc.font_measurements.baseline * f,
+                "family": fonts[0],
+                "font": fonts[1],
+                "color": self.get_backend_properties(properties).color,
+                "box": box,
+            })
+            if TEXT_AS_OUTLINE:
+                RenderPipeline2d.draw_text(self, text, transform, properties, cap_height, dxftype)
+
+    def count_ink(backend, d, properties):
+        if d and backend.resolve_color(properties.color)[1] > 0.0:
+            ink[0] += 1
+
+    class NoCssRenderBackend(svg.SVGRenderBackend):
+        def add_strokes(self, d, properties):
+            if not d:
+                return
+            count_ink(self, d, properties)
+            el = ET.SubElement(self.entities, "path", d=d)
+            color, opacity = self.resolve_color(properties.color)
+            el.set("fill", "none")
+            el.set("stroke", color)
+            el.set("stroke-width", str(self.resolve_stroke_width(properties.lineweight)))
+            if opacity < 1.0:
+                el.set("stroke-opacity", "%.3f" % opacity)
+
+        def add_filling(self, d, properties):
+            if not d:
+                return
+            count_ink(self, d, properties)
+            el = ET.SubElement(self.entities, "path", d=d)
+            color, opacity = self.resolve_color(properties.color)
+            el.set("fill", color)
+            if opacity < 1.0:
+                el.set("fill-opacity", "%.3f" % opacity)
+
+    class OutlineRenderBackend(svg.SVGRenderBackend):
+        def add_strokes(self, d, properties):
+            count_ink(self, d, properties)
+            super().add_strokes(d, properties)
+
+        def add_filling(self, d, properties):
+            count_ink(self, d, properties)
+            super().add_filling(d, properties)
+
+    class Backend(svg.SVGBackend):
+        def __init__(self):
+            super().__init__()
+            self.frame = BoundingBox2d()
+            self.unbounded = False
+
+        def store(self, record, properties):
+            if not self.unbounded:
+                b = record.bbox()
+                if b.has_data:
+                    self.frame.extend((b.extmin, b.extmax))
+            super().store(record, properties)
+
+        @staticmethod
+        def make_backend(page, settings):
+            if TEXT_AS_OUTLINE:
+                return OutlineRenderBackend(page, settings)
+            return NoCssRenderBackend(page, settings)
+
+    class DXFFrontend(Frontend):
+        def __init__(self, ctx, pipeline, cfg):
+            UniversalFrontend.__init__(self, ctx, pipeline, cfg)
+
+        def draw_entities(self, entities, *, filter_func=None):
+            super().draw_entities(entities, filter_func=keep)
+
+        def draw_entity(self, entity, properties):
+            state["entities_drawn"] += 1
+            if state["entities_drawn"] > max_drawn:
+                raise DrawnOverCap(state["entities_drawn"])
+            super().draw_entity(entity, properties)
+
+        def draw_complex_mtext(self, mtext, properties):
+            saved = self.pipeline.run_alpha
+            self.pipeline.run_alpha = properties.color[7:9]
+            try:
+                super().draw_complex_mtext(mtext, properties)
+            finally:
+                self.pipeline.run_alpha = saved
+
+        def draw_hatch_pattern(self, polygon, paths, properties):
+            sink = io.StringIO()
+            saved = sys.stdout
+            sys.stdout = sink
+            try:
+                super().draw_hatch_pattern(polygon, paths, properties)
+            finally:
+                sys.stdout = saved
+                captured = sink.getvalue()
+                sys.stderr.write(captured)
+            if HATCH_TIMEOUT_MESSAGE in captured:
+                state["hatch_truncated"] += 1
+
+        def draw_line_entity(self, entity, properties):
+            kind = entity.dxftype()
+            if kind in INFINITE_LINES:
+                infinite.append((kind, Vec2(entity.dxf.start), Vec2(entity.dxf.unit_vector), properties))
+                return
+            super().draw_line_entity(entity, properties)
+
+    backend = Backend()
+    pipeline = TextPipeline(backend)
+    if "default_font_face" not in vars(pipeline):
+        raise FontUnavailable("default")
+    cfg = config.Configuration(
+        background_policy=config.BackgroundPolicy.OFF,
+        image_policy=config.ImagePolicy.IGNORE,
+        proxy_graphic_policy=config.ProxyGraphicPolicy.SHOW,
+        color_policy=config.ColorPolicy.COLOR,
+        hatching_timeout=HATCH_TIMEOUT_S,
+    )
+    fe = DXFFrontend(RenderContext(doc), pipeline, cfg)
+    fe.draw_layout(doc.modelspace(), finalize=False, filter_func=keep)
+
+    frame = BoundingBox2d()
+    if backend.frame.has_data:
+        frame.extend((backend.frame.extmin, backend.frame.extmax))
+    for t in texts:
+        if t["box"].has_data:
+            frame.extend((t["box"].extmin, t["box"].extmax))
+    if not frame.has_data:
+        raise Outcome("empty", "nothing_drawable", EXIT_EMPTY)
+    if not (frame.size.x > 0.0 or frame.size.y > 0.0):
+        raise Outcome("empty", "zero_extent", EXIT_EMPTY)
+    drawn_box = ((frame.extmin.x, frame.extmin.y), (frame.extmax.x, frame.extmax.y))
+    frame, fw, fh = padded_frame(frame, BoundingBox2d)
+
+    if infinite:
+        rect = ClippingRect2d(Vec2(frame.extmin), Vec2(frame.extmax))
+        reach = (fw + fh) * 2.0 + 1.0
+        backend.unbounded = True
+        for kind, p0, direction, props in infinite:
+            if direction.is_null:
+                continue
+            d = direction.normalize()
+            a = p0 - d * reach if kind == "XLINE" else p0
+            for s, e in rect.clip_line(a, p0 + d * reach):
+                fe.pipeline.draw_line(s, e, props)
+        backend.unbounded = False
+    fe.pipeline.finalize()
+
+    aspect = max(min(fw, fh) / max(fw, fh), 1.0 / ASPECT_CLAMP)
+    inner = PAGE_LONG_MM - 2.0 * PAGE_MARGIN_MM
+    short_mm = inner * aspect + 2.0 * PAGE_MARGIN_MM
+    if fw >= fh:
+        page_w, page_h = PAGE_LONG_MM, short_mm
+    else:
+        page_w, page_h = short_mm, PAGE_LONG_MM
+    page = layout.Page(page_w, page_h, layout.Units.mm, margins=layout.Margins.all(PAGE_MARGIN_MM))
+    settings = layout.Settings(fit_page=True, output_coordinate_space=COORDINATE_SPACE)
+    root = backend.get_xml_root_element(page, settings=settings, render_box=frame)
+    group = root.find("g")
+    T = backend.transformation_matrix
+    if group is None or T is None:
+        raise ValueError("empty page")
+    state["page_w_mm"] = float(root.get("width", "0mm")[:-2])
+    state["page_h_mm"] = float(root.get("height", "0mm")[:-2])
+
+    emitted = []
+    flip = Matrix44.scale(1, -1, 1)
+    for t in [] if TEXT_AS_OUTLINE else texts:
+        m = flip @ Matrix44.translate(0, t["shift"], 0) @ t["m"] @ T
+        k = math.hypot(m[1, 0], m[1, 1])
+        values = (m[0, 0], m[0, 1], m[1, 0], m[1, 1], m[3, 0], m[3, 1], k, t["em"])
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError("non-finite text transform")
+        size = t["em"] * k
+        if k <= 0.0 or size <= 0.0:
+            continue
+        el = ET.SubElement(group, "text")
+        el.set("transform", "matrix(%s)" % " ".join("%.6g" % v for v in (
+            m[0, 0] / k, m[0, 1] / k, m[1, 0] / k, m[1, 1] / k, m[3, 0], m[3, 1])))
+        el.set("font-family", t["family"])
+        el.set("font-size", "%.6g" % size)
+        for k, v in t["font"]:
+            el.set(k, v)
+        el.set("fill", t["color"][:7])
+        opacity = svg.alpha_to_opacity(t["color"][7:9])
+        if opacity < 1.0:
+            el.set("fill-opacity", "%.3f" % opacity)
+        if opacity > 0.0:
+            ink[0] += 1
+        el.set(XML_SPACE, "preserve")
+        el.text = t["text"]
+        emitted.append({"text": t["text"], "covered": t["covered"], "el": el, "render": t["render"], "invisible": opacity == 0.0})
+    if not ink[0]:
+        raise Outcome("empty", "nothing_visible", EXIT_EMPTY)
+    state["texts"] = len(emitted)
+    state["uncovered"] = sum(len(e["text"]) - len(e["covered"]) for e in emitted)
+    state["render_substituted"] = sum(1 for e in emitted for a, b in zip(e["text"], e["render"]) if a != b)
+    return root, drawn_box, emitted
+
+
+def write_outputs(args, state, root, drawn_box, emitted):
+    try:
+        ET.ElementTree(root).write(args.svg, encoding="utf-8", xml_declaration=True)
+        for e in emitted:
+            e["el"].text = e["render"]
+        ET.ElementTree(root).write(args.render_svg, encoding="utf-8", xml_declaration=True)
+        for e in emitted:
+            e["el"].text = e["text"]
+        rows = []
+        for e in emitted:
+            row = {"text": e["text"], "covered": e["covered"]}
+            if e["invisible"]:
+                row["invisible"] = True
+            rows.append(row)
+        text = json.dumps({"texts": rows}, separators=(",", ":"), ensure_ascii=True)
+        with open(args.texts, "w", encoding="ascii") as fh:
+            fh.write(text)
+        if args.measure:
+            text = json.dumps(measure_draft(state, drawn_box), separators=(",", ":"), sort_keys=True, allow_nan=False)
+            with open(args.measure, "w", encoding="ascii") as fh:
+                fh.write(text)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("cad-dxf: write: %s: %s\n" % (exc.__class__.__name__, exc))
+        raise Outcome("failed", "write_failed", EXIT_FAILED)
+
+
+def run(args, state):
+    doc = read_document(args.src, state)
+    from ezdxf.fonts.font_manager import FontNotFoundError
+    try:
+        root, drawn_box, emitted = draw(doc, args.max_drawn_entities, state)
+    except Outcome:
+        raise
+    except DrawnOverCap:
+        raise Outcome("too_complex", "drawn_entities_over_cap", EXIT_TOO_COMPLEX)
+    except RecursionError:
+        raise Outcome("too_complex", "recursion", EXIT_TOO_COMPLEX)
+    except MemoryError:
+        raise Outcome("too_complex", "out_of_memory", EXIT_TOO_COMPLEX)
+    except (FontUnavailable, FontNotFoundError) as exc:
+        sys.stderr.write("cad-dxf: no TrueType font available: %s: %s\n" % (exc.__class__.__name__, exc))
+        raise Outcome("failed", "font_unavailable", EXIT_FAILED)
+    except Exception as exc:
+        sys.stderr.write("cad-dxf: %s: %s\n" % (exc.__class__.__name__, exc))
+        raise Outcome("failed", "draw_exception", EXIT_FAILED)
+    write_outputs(args, state, root, drawn_box, emitted)
+
+
+def main():
+    ap = Parser(prog="cad-dxf", add_help=False)
+    ap.add_argument("--max-drawn-entities", type=int, required=True)
+    ap.add_argument("--texts", required=True)
+    ap.add_argument("--render-svg", required=True)
+    ap.add_argument("--measure", default="")
+    ap.add_argument("src")
+    ap.add_argument("svg")
+    args = ap.parse_args()
+    if args.max_drawn_entities < 1:
+        ap.error("--max-drawn-entities must be at least 1")
+    fd = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    state = new_state()
+    try:
+        run(args, state)
+    except Outcome as out:
+        write_verdict(fd, state, out.verdict, out.reason)
+        return out.code
+    write_verdict(fd, state, "ok", "")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
