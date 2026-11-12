@@ -375,6 +375,7 @@ func TestAttemptDeadlineStopsStalledDownload(t *testing.T) {
 
 func TestProgressDeadlineReportsTimeout(t *testing.T) {
 	failed := make(chan []byte, 4)
+	puts := make(chan struct{}, 4)
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -388,6 +389,14 @@ func TestProgressDeadlineReportsTimeout(t *testing.T) {
 		}
 		if r.Method == http.MethodGet {
 			_, _ = w.Write([]byte("step"))
+			return
+		}
+		if r.Method == http.MethodPut {
+			select {
+			case puts <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		raw, err := io.ReadAll(r.Body)
@@ -435,5 +444,85 @@ func TestProgressDeadlineReportsTimeout(t *testing.T) {
 		}
 	default:
 		t.Fatal("fail was not posted")
+	}
+	select {
+	case <-puts:
+		t.Fatal("upload after the progress deadline")
+	default:
+	}
+	select {
+	case extra := <-failed:
+		t.Fatalf("second fail %s", extra)
+	default:
+	}
+}
+
+func TestProgressLeaseLossStopsAssignment(t *testing.T) {
+	stopped := make(chan []byte, 2)
+	failed := make(chan struct{}, 2)
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("step"))
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/progress") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":"attempt_not_active"}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/stopped") {
+			w.WriteHeader(http.StatusNoContent)
+			stopped <- raw
+			return
+		}
+		if strings.Contains(r.URL.Path, "/fail") {
+			w.WriteHeader(http.StatusNoContent)
+			failed <- struct{}{}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	c.fileHTTP = c.coreHTTP
+	c.operation = convert.OperationConvert
+	href := c.core.String() + "/objects"
+	later := time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	asgn := assignmentJSON{
+		AttemptID:       "attempt",
+		AttemptToken:    "tok",
+		AttemptDeadline: later,
+		LeaseExpiresAt:  later,
+		Inputs:          []fileLinkJSON{{Role: "source", Ordinal: 0, Href: href, Format: "step"}},
+		Outputs:         []fileLinkJSON{{Role: "primary", Ordinal: 0, Href: href, Format: "stl"}},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- c.runAssignment(context.Background(), asgn, controlJSON{})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("assignment continued after lease loss")
+	}
+	select {
+	case body := <-stopped:
+		if !strings.Contains(string(body), `"reason":"lease_lost"`) {
+			t.Fatalf("stopped body %s", body)
+		}
+	default:
+		t.Fatal("stopped was not posted")
+	}
+	select {
+	case <-failed:
+		t.Fatal("fail after lease loss")
+	default:
 	}
 }
