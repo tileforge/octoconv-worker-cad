@@ -32,7 +32,12 @@ const (
 	envProtocolWorkerID = "CAD_PROTOCOL_WORKER_ID"
 	envProtocolManifest = "CAD_PROTOCOL_MANIFEST_PATH"
 
-	maxProtocolFileBytes = 100 << 20
+	maxProtocolFileBytes = max(
+		convert.CADMaxDXFBytes,
+		convert.CADMaxDXFSVGBytes,
+		convert.CADMaxIGESBytes,
+		convert.CADMaxSTLBytes,
+	)
 	maxProtocolJSONBytes = 262144
 
 	stoppedNotifyTimeout  = 5 * time.Second

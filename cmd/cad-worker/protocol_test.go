@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"go/parser"
 	"go/token"
 	"io"
@@ -524,5 +525,38 @@ func TestProgressLeaseLossStopsAssignment(t *testing.T) {
 	case <-failed:
 		t.Fatal("fail after lease loss")
 	default:
+	}
+}
+
+func TestProtocolFileCapCoversCADTransfers(t *testing.T) {
+	floors := []struct {
+		name string
+		n    int64
+	}{
+		{name: "iges input", n: convert.CADMaxIGESBytes},
+		{name: "dxf input", n: convert.CADMaxDXFBytes},
+		{name: "svg output", n: convert.CADMaxDXFSVGBytes},
+		{name: "stl", n: convert.CADMaxSTLBytes},
+	}
+	for _, floor := range floors {
+		if int64(maxProtocolFileBytes) < floor.n {
+			t.Errorf("maxProtocolFileBytes %d is below %s %d", maxProtocolFileBytes, floor.name, floor.n)
+		}
+	}
+	if maxProtocolFileBytes <= 100<<20 {
+		t.Fatalf("maxProtocolFileBytes = %d, want a ceiling above 100 MiB", maxProtocolFileBytes)
+	}
+}
+
+func TestReadLimitedJobFileHonorsAssignmentCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.svg")
+	if err := os.WriteFile(path, []byte("abcd"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLimitedJobFile(path, convert.CADMaxDXFSVGBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLimitedJobFile(path, 3); !errors.Is(err, errOutputTooLarge) {
+		t.Fatalf("readLimitedJobFile: %v", err)
 	}
 }
