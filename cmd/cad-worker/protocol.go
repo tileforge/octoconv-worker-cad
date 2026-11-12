@@ -191,6 +191,7 @@ type protocolClient struct {
 	mu       sync.Mutex
 	active   *liveAttempt
 	draining bool
+	term     chan struct{}
 }
 
 func newProtocolClient(dial protocolDial) (*protocolClient, error) {
@@ -226,6 +227,7 @@ func newProtocolClient(dial protocolDial) (*protocolClient, error) {
 		freeSlots:   dial.freeSlots,
 		operation:   operation,
 		engineLimit: dial.engineLimit,
+		term:        make(chan struct{}),
 	}, nil
 }
 
@@ -300,13 +302,25 @@ func (c *protocolClient) loop(ctx context.Context) error {
 		return nil
 	}
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || c.sessionTerminating() {
 			return nil
 		}
 		if c.sessionDraining() {
 			return c.deleteSession(ctx)
 		}
-		pull, err := c.pull(ctx)
+		pullCtx, cancelPull := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-c.term:
+				cancelPull()
+			case <-pullCtx.Done():
+			}
+		}()
+		pull, err := c.pull(pullCtx)
+		cancelPull()
+		if c.sessionTerminating() {
+			return nil
+		}
 		if ctx.Err() != nil && !errors.Is(err, errSessionClosed) {
 			return nil
 		}
@@ -323,6 +337,8 @@ func (c *protocolClient) loop(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return nil
+			case <-c.term:
+				return nil
 			case <-time.After(200 * time.Millisecond):
 			}
 			continue
@@ -331,7 +347,7 @@ func (c *protocolClient) loop(ctx context.Context) error {
 			if err := c.runAssignment(ctx, asgn, pull.Control); err != nil {
 				return err
 			}
-			if pull.Control.Terminate {
+			if pull.Control.Terminate || c.sessionTerminating() {
 				return nil
 			}
 			if pull.Control.Drain || c.sessionDraining() {
@@ -395,15 +411,37 @@ func (c *protocolClient) applyHeartbeat(ctrl controlJSON) {
 	}
 	run := c.active
 	c.mu.Unlock()
-	if run == nil {
+	if ctrl.Terminate {
+		c.markTerminated()
+		if run != nil {
+			c.stopAttempt(run.parent, run.cancel, run.flag, run.asgn, "terminate", errors.New("terminate"))
+		}
 		return
 	}
-	if ctrl.Terminate {
-		c.stopAttempt(run.parent, run.cancel, run.flag, run.asgn, "terminate", errors.New("terminate"))
+	if run == nil {
 		return
 	}
 	if containsID(ctrl.CancelAttemptIDs, run.asgn.AttemptID) {
 		c.stopAttempt(run.parent, run.cancel, run.flag, run.asgn, "cancel", errors.New("cancel"))
+	}
+}
+
+func (c *protocolClient) markTerminated() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.term:
+	default:
+		close(c.term)
+	}
+}
+
+func (c *protocolClient) sessionTerminating() bool {
+	select {
+	case <-c.term:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -588,11 +626,15 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	if asgn.AttemptID == "" || asgn.AttemptToken == "" {
 		return errors.New("assignment")
 	}
-	if !oneLink(asgn.Inputs, "source") || !oneLink(asgn.Outputs, "primary") {
+	primary, measurements, ok := assignmentOutputs(asgn.Outputs)
+	if !oneLink(asgn.Inputs, "source") || !ok {
+		return c.fail(ctx, asgn, "engine_error", "assignment")
+	}
+	if measurements != nil && c.operation != convert.OperationRender {
 		return c.fail(ctx, asgn, "engine_error", "assignment")
 	}
 	in := asgn.Inputs[0]
-	out := asgn.Outputs[0]
+	out := primary
 	if _, err := requireHTTPS(in.Href); err != nil {
 		return err
 	}
@@ -646,7 +688,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		return err
 	}
 
-	produced, err := c.convert(attemptCtx, in.Format, out.Format, src, deadline, asgn.Limits.MaxOutputBytes)
+	produced, measured, err := c.convert(attemptCtx, in.Format, out.Format, src, deadline, asgn.Limits.MaxOutputBytes)
 	if done, stopErr := c.alreadyStopped(ctx, &flag); done {
 		return stopErr
 	}
@@ -658,6 +700,9 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 			return c.fail(ctx, asgn, "engine_error", "output too large")
 		}
 		return c.fail(ctx, asgn, cadEngineCode(err), safeMessage(err))
+	}
+	if measurements != nil && len(measured) == 0 {
+		return c.fail(ctx, asgn, "engine_error", "assignment")
 	}
 	if err := c.postProgress(attemptCtx, asgn, 99); err != nil {
 		if done, stopErr := c.alreadyStopped(ctx, &flag); done {
@@ -677,23 +722,28 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		}
 		return c.fail(ctx, asgn, cadEngineCode(err), safeMessage(err))
 	}
+	artifacts := []artifactJSON{artifactFor("primary", out.Ordinal, out.Format, produced)}
+	if measurements != nil {
+		if err := c.putFile(attemptCtx, measurements.Href, measured, convert.MIMEType(measurements.Format)); err != nil {
+			if done, stopErr := c.alreadyStopped(ctx, &flag); done {
+				return stopErr
+			}
+			if errors.Is(err, errOriginRejected) {
+				return errOriginRejected
+			}
+			return c.fail(ctx, asgn, cadEngineCode(err), safeMessage(err))
+		}
+		artifacts = append(artifacts, artifactFor("measurements", measurements.Ordinal, measurements.Format, measured))
+	}
 	if !flag.claim("complete", nil) {
 		if errors.Is(flag.cause(), errSessionClosed) {
 			return errSessionClosed
 		}
 		return nil
 	}
-	sum := sha256.Sum256(produced)
 	completeBody, err := json.Marshal(completeJSON{
 		ProtocolVersion: 1,
-		Artifacts: []artifactJSON{{
-			Role:        "primary",
-			Ordinal:     0,
-			Format:      out.Format,
-			ContentType: convert.MIMEType(out.Format),
-			SHA256:      hex.EncodeToString(sum[:]),
-			ByteSize:    int64(len(produced)),
-		}},
+		Artifacts:       artifacts,
 	})
 	if err != nil {
 		return err
@@ -713,20 +763,58 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	return err
 }
 
-func (c *protocolClient) convert(ctx context.Context, from, to string, src []byte, deadline time.Time, maxOut int64) ([]byte, error) {
+func artifactFor(role string, ordinal int, format string, body []byte) artifactJSON {
+	sum := sha256.Sum256(body)
+	return artifactJSON{
+		Role:        role,
+		Ordinal:     ordinal,
+		Format:      format,
+		ContentType: convert.MIMEType(format),
+		SHA256:      hex.EncodeToString(sum[:]),
+		ByteSize:    int64(len(body)),
+	}
+}
+
+func assignmentOutputs(links []fileLinkJSON) (fileLinkJSON, *fileLinkJSON, bool) {
+	var primary fileLinkJSON
+	var measurements *fileLinkJSON
+	var nPrimary, nMeasure int
+	for _, link := range links {
+		switch link.Role {
+		case "primary":
+			nPrimary++
+			primary = link
+		case "measurements":
+			copied := link
+			nMeasure++
+			measurements = &copied
+		default:
+			return fileLinkJSON{}, nil, false
+		}
+	}
+	if nPrimary != 1 || primary.Ordinal != 0 || primary.Href == "" || nMeasure > 1 {
+		return fileLinkJSON{}, nil, false
+	}
+	if measurements != nil && (measurements.Href == "" || measurements.Format == "") {
+		return fileLinkJSON{}, nil, false
+	}
+	return primary, measurements, true
+}
+
+func (c *protocolClient) convert(ctx context.Context, from, to string, src []byte, deadline time.Time, maxOut int64) ([]byte, []byte, error) {
 	conv, ok := convert.Default.LookupOp(c.operation, from, to)
 	if !ok {
-		return nil, fmt.Errorf("no converter for %s %s to %s", c.operation, from, to)
+		return nil, nil, fmt.Errorf("no converter for %s %s to %s", c.operation, from, to)
 	}
 	dir, err := os.MkdirTemp("", "octoconv-cad-")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer os.RemoveAll(dir)
 	inPath := filepath.Join(dir, "in."+from)
 	outPath := filepath.Join(dir, "out."+to)
 	if err := os.WriteFile(inPath, src, 0o600); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	budget := c.engineLimit
 	if until := time.Until(deadline); until < budget {
@@ -735,9 +823,28 @@ func (c *protocolClient) convert(ctx context.Context, from, to string, src []byt
 	convertCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	if err := conv.Convert(convertCtx, inPath, outPath, nil); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return readLimitedJobFile(outPath, maxOut)
+	primary, err := readLimitedJobFile(outPath, maxOut)
+	if err != nil {
+		return nil, nil, err
+	}
+	sidePath := convert.CADMeasurementsPath(outPath)
+	info, statErr := os.Stat(sidePath)
+	if os.IsNotExist(statErr) {
+		return primary, nil, nil
+	}
+	if statErr != nil {
+		return nil, nil, statErr
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, errors.New("measurements")
+	}
+	measured, err := readLimitedJobFile(sidePath, maxOut)
+	if err != nil {
+		return nil, nil, err
+	}
+	return primary, measured, nil
 }
 
 func readLimitedJobFile(path string, maxOut int64) ([]byte, error) {
@@ -812,6 +919,7 @@ func (c *protocolClient) renewLoop(parent, attempt context.Context, cancelAttemp
 				continue
 			}
 			if ctrl.Terminate {
+				c.markTerminated()
 				c.stopAttempt(parent, cancelAttempt, flag, asgn, "terminate", errors.New("terminate"))
 				return
 			}

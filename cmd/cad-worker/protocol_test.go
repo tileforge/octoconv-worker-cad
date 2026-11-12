@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"go/parser"
 	"go/token"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -123,5 +129,83 @@ func TestWorkerSourcesDoNotImportStores(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestAssignmentOutputs(t *testing.T) {
+	primary := fileLinkJSON{Role: "primary", Href: "https://files/primary", Format: "png"}
+	measure := fileLinkJSON{Role: "measurements", Href: "https://files/measure", Format: "json"}
+	got, extra, ok := assignmentOutputs([]fileLinkJSON{primary})
+	if !ok || extra != nil || got.Href != primary.Href {
+		t.Fatalf("primary only: %+v extra=%v ok=%v", got, extra, ok)
+	}
+	_, extra, ok = assignmentOutputs([]fileLinkJSON{primary, measure})
+	if !ok || extra == nil || extra.Href != measure.Href {
+		t.Fatalf("measurements: %+v ok=%v", extra, ok)
+	}
+	if _, _, ok = assignmentOutputs([]fileLinkJSON{primary, primary}); ok {
+		t.Fatal("two primaries accepted")
+	}
+	if _, _, ok = assignmentOutputs([]fileLinkJSON{primary, {Role: "sidecar", Href: "https://files/side", Format: "json"}}); ok {
+		t.Fatal("sidecar accepted")
+	}
+	if _, _, ok = assignmentOutputs([]fileLinkJSON{primary, {Role: "measurements", Format: "json"}}); ok {
+		t.Fatal("measurements without href accepted")
+	}
+}
+
+func TestHeartbeatTerminateWakesIdleSession(t *testing.T) {
+	c := &protocolClient{term: make(chan struct{})}
+	c.applyHeartbeat(controlJSON{Terminate: true})
+	if !c.sessionTerminating() {
+		t.Fatal("idle session still accepts work")
+	}
+}
+
+func TestHeartbeatTerminateNotifiesActiveAttempt(t *testing.T) {
+	reported := make(chan []byte, 1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		reported <- raw
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	core, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flag := &stopFlag{}
+	_, cancel := context.WithCancelCause(context.Background())
+	c := &protocolClient{
+		core:         core,
+		coreHTTP:     srv.Client(),
+		term:         make(chan struct{}),
+		sessionID:    "sess",
+		sessionToken: "token",
+		active: &liveAttempt{
+			parent: context.Background(),
+			cancel: cancel,
+			flag:   flag,
+			asgn:   assignmentJSON{AttemptID: "attempt", AttemptToken: "attempt-token"},
+		},
+	}
+	c.applyHeartbeat(controlJSON{Terminate: true})
+	if !c.sessionTerminating() {
+		t.Fatal("session still accepts work")
+	}
+	if flag.outcome() != "terminate" {
+		t.Fatalf("outcome %q", flag.outcome())
+	}
+	var body []byte
+	select {
+	case body = <-reported:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopped request")
+	}
+	if !strings.Contains(string(body), `"reason":"terminate"`) {
+		t.Fatalf("stopped body %s", body)
 	}
 }
