@@ -322,3 +322,53 @@ func TestLeaseDrainIsRemembered(t *testing.T) {
 		t.Fatal("renew loop did not return")
 	}
 }
+
+func TestAttemptDeadlineStopsStalledDownload(t *testing.T) {
+	failed := make(chan []byte, 1)
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			<-r.Context().Done()
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/fail") {
+			failed <- raw
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	c.fileHTTP = c.coreHTTP
+	c.operation = convert.OperationConvert
+	href := c.core.String() + "/objects"
+	asgn := assignmentJSON{
+		AttemptID:       "attempt",
+		AttemptToken:    "tok",
+		AttemptDeadline: time.Now().Add(300 * time.Millisecond).Format(time.RFC3339Nano),
+		LeaseExpiresAt:  time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		Inputs:          []fileLinkJSON{{Role: "source", Ordinal: 0, Href: href, Format: "step"}},
+		Outputs:         []fileLinkJSON{{Role: "primary", Ordinal: 0, Href: href, Format: "stl"}},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- c.runAssignment(context.Background(), asgn, controlJSON{})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("attempt ignored the deadline")
+	}
+	select {
+	case body := <-failed:
+		if !strings.Contains(string(body), `"engine_code":"timeout"`) {
+			t.Fatalf("fail body %s", body)
+		}
+	default:
+		t.Fatal("fail was not posted")
+	}
+}

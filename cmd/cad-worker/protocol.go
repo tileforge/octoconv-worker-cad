@@ -661,7 +661,8 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		return c.fail(ctx, asgn, "engine_error", "assignment")
 	}
 
-	attemptCtx, cancelAttempt := context.WithCancelCause(ctx)
+	bounded, cancelDeadline := context.WithDeadline(ctx, deadline)
+	attemptCtx, cancelAttempt := context.WithCancelCause(bounded)
 	var flag stopFlag
 	c.setActive(&liveAttempt{asgn: asgn, parent: ctx, cancel: cancelAttempt, flag: &flag})
 	var wg sync.WaitGroup
@@ -673,6 +674,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	defer func() {
 		c.clearActive()
 		cancelAttempt(context.Canceled)
+		cancelDeadline()
 		wg.Wait()
 	}()
 
