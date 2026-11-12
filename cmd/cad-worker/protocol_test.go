@@ -209,3 +209,116 @@ func TestHeartbeatTerminateNotifiesActiveAttempt(t *testing.T) {
 		t.Fatalf("stopped body %s", body)
 	}
 }
+
+type deadlineTrip struct {
+	base http.RoundTripper
+	ok   bool
+	left time.Duration
+}
+
+func (d *deadlineTrip) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !d.ok {
+		if dl, ok := r.Context().Deadline(); ok {
+			d.ok = true
+			d.left = time.Until(dl)
+		}
+	}
+	return d.base.RoundTrip(r)
+}
+
+func protocolTestClient(t *testing.T, handler http.Handler, trip *deadlineTrip) *protocolClient {
+	t.Helper()
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+	core, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpClient := srv.Client()
+	if trip != nil {
+		trip.base = httpClient.Transport
+		httpClient.Transport = trip
+	}
+	return &protocolClient{
+		core:     core,
+		coreHTTP: httpClient,
+		term:     make(chan struct{}),
+	}
+}
+
+func TestHelloRequestHasDeadline(t *testing.T) {
+	trip := &deadlineTrip{}
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"session_id":"sess","session_token":"token"}`)
+	}), trip)
+	if _, err := c.hello(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !trip.ok {
+		t.Fatal("hello has no deadline")
+	}
+	if trip.left > helloTimeout || trip.left < helloTimeout-2*time.Second {
+		t.Fatalf("hello deadline %s", trip.left)
+	}
+}
+
+func TestPullRequestAllowsLongPoll(t *testing.T) {
+	const wait = 20
+	trip := &deadlineTrip{}
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"assignments":[]}`)
+	}), trip)
+	c.pullWait = wait
+	c.sessionID = "sess"
+	c.sessionToken = "token"
+	if _, err := c.pull(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !trip.ok {
+		t.Fatal("pull has no deadline")
+	}
+	limit := time.Duration(wait)*time.Second + pullGrace
+	if trip.left > limit || trip.left < limit-2*time.Second {
+		t.Fatalf("pull deadline %s, want about %s", trip.left, limit)
+	}
+}
+
+func TestLeaseDrainIsRemembered(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	body := `{"lease_expires_at":"` + deadline.Format(time.RFC3339Nano) + `","control":{"drain":true}}`
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/lease") {
+			t.Errorf("path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}), nil)
+	parent, stop := context.WithCancel(context.Background())
+	attempt, cancelAttempt := context.WithCancelCause(parent)
+	flag := &stopFlag{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.renewLoop(parent, attempt, cancelAttempt, flag, assignmentJSON{AttemptID: "attempt", AttemptToken: "tok"}, time.Now().Add(time.Minute), deadline)
+	}()
+	waitUntil := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitUntil) && !c.sessionDraining() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !c.sessionDraining() {
+		stop()
+		t.Fatal("drain was not recorded")
+	}
+	if attempt.Err() != nil || flag.outcome() != "" {
+		stop()
+		t.Fatalf("drain stopped the attempt: %v %q", attempt.Err(), flag.outcome())
+	}
+	stop()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renew loop did not return")
+	}
+}

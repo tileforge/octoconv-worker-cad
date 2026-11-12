@@ -37,6 +37,8 @@ const (
 
 	stoppedNotifyTimeout  = 5 * time.Second
 	terminalReportTimeout = 5 * time.Second
+	helloTimeout          = 10 * time.Second
+	pullGrace             = 5 * time.Second
 )
 
 var (
@@ -523,7 +525,7 @@ func (c *protocolClient) hello(ctx context.Context) (helloJSON, error) {
 	if err != nil {
 		return helloJSON{}, err
 	}
-	raw, err := c.postCore(ctx, "/worker/v1/sessions", body, "", "", false, 0)
+	raw, err := c.postCore(ctx, "/worker/v1/sessions", body, "", "", false, helloTimeout)
 	if err != nil {
 		return helloJSON{}, err
 	}
@@ -593,7 +595,16 @@ func (c *protocolClient) pull(ctx context.Context) (pullResponseJSON, error) {
 	if err != nil {
 		return pullResponseJSON{}, err
 	}
-	raw, err := c.postCore(ctx, "/worker/v1/sessions/"+url.PathEscape(c.sessionID)+"/pull", body, c.sessionToken, "", true, 0)
+	budget := time.Duration(wait)*time.Second + pullGrace
+	raw, err := c.postCore(
+		ctx,
+		"/worker/v1/sessions/"+url.PathEscape(c.sessionID)+"/pull",
+		body,
+		c.sessionToken,
+		"",
+		true,
+		budget,
+	)
 	if err != nil {
 		var status *statusError
 		if errors.As(err, &status) && status.code == "rate_limited" {
@@ -917,6 +928,11 @@ func (c *protocolClient) renewLoop(parent, attempt context.Context, cancelAttemp
 			if err != nil {
 				timer.Reset(cappedWait(leaseUntil, renewEvery(c.leaseSeconds)))
 				continue
+			}
+			if ctrl.Drain {
+				c.mu.Lock()
+				c.draining = true
+				c.mu.Unlock()
 			}
 			if ctrl.Terminate {
 				c.markTerminated()
