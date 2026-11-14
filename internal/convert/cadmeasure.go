@@ -44,6 +44,7 @@ type cadMeasureDraft struct {
 	Area            *float64          `json:"area"`
 	NullReason      string            `json:"null_reason"`
 	Triangles       int               `json:"triangles"`
+	MeshFindings    []string          `json:"mesh_findings,omitempty"`
 }
 
 func cadDraftError(format string, args ...any) error {
@@ -245,6 +246,12 @@ func buildCADMeasurements(d cadMeasureDraft, assumeUnit string) (measurements.Do
 		doc.Area = &v
 	} else {
 		doc.AreaNullReason = d.NullReason
+	}
+	if len(d.MeshFindings) > 0 {
+		if d.Format != measurements.FormatSTL {
+			return measurements.Document{}, cadDraftError("mesh_findings are only for stl")
+		}
+		doc.MeshFindings = append([]string(nil), d.MeshFindings...)
 	}
 	if err := doc.Validate(); err != nil {
 		return measurements.Document{}, fmt.Errorf("%w: %w", ErrCADMeasure, err)
