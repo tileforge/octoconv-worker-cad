@@ -65,8 +65,9 @@ var cadGuardEngines = []string{"cad-guard"}
 
 var cadDXFReadOnly = []string{
 	"/opt/venv",
-	"/usr/bin/python3.11",
-	"/usr/lib/python3.11",
+	"/usr/local/bin/python3.12",
+	"/usr/local/lib/libpython3.12.so.1.0",
+	"/usr/local/lib/python3.12",
 	"/usr/share/fonts",
 }
 
