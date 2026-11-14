@@ -10,9 +10,7 @@
       "parameter_schema": {},
       "formats": [
         {"from": "step", "to": "stl"},
-        {"from": "iges", "to": "stl"},
-        {"from": "dxf", "to": "svg"},
-        {"from": "dxf", "to": "pdf"}
+        {"from": "iges", "to": "stl"}
       ]
     }
   ]

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"go/parser"
 	"go/token"
@@ -86,6 +87,101 @@ func TestManifestOperation(t *testing.T) {
 	got, err = manifestOperation(renderManifest)
 	if err != nil || got != convert.OperationRender {
 		t.Fatalf("render operation %q %v", got, err)
+	}
+	drawConvert, err := os.ReadFile(filepath.Join("..", "..", "schema", "manifest-caddraw-convert.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drawRender, err := os.ReadFile(filepath.Join("..", "..", "schema", "manifest-caddraw-render.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = manifestOperation(drawConvert)
+	if err != nil || got != convert.OperationConvert {
+		t.Fatalf("drawing convert operation %q %v", got, err)
+	}
+	got, err = manifestOperation(drawRender)
+	if err != nil || got != convert.OperationRender {
+		t.Fatalf("drawing render operation %q %v", got, err)
+	}
+}
+
+func TestManifestPairsStayDisjoint(t *testing.T) {
+	type pair struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	type document struct {
+		Capabilities []struct {
+			ID     string `json:"id"`
+			Legacy struct {
+				Engine string `json:"engine"`
+			} `json:"legacy"`
+			Formats []pair `json:"formats"`
+		} `json:"capabilities"`
+	}
+	type expect struct {
+		id    string
+		pairs []pair
+	}
+	want := map[string]expect{
+		"manifest-cad-convert.json": {
+			id:    "octoconv.convert.cad",
+			pairs: []pair{{From: "step", To: "stl"}, {From: "iges", To: "stl"}},
+		},
+		"manifest-cad-render.json": {
+			id: "octoconv.render.cad",
+			pairs: []pair{
+				{From: "step", To: "png"},
+				{From: "iges", To: "png"},
+				{From: "stl", To: "png"},
+			},
+		},
+		"manifest-caddraw-convert.json": {
+			id:    "octoconv.convert.caddraw",
+			pairs: []pair{{From: "dxf", To: "svg"}, {From: "dxf", To: "pdf"}},
+		},
+		"manifest-caddraw-render.json": {
+			id:    "octoconv.render.caddraw",
+			pairs: []pair{{From: "dxf", To: "png"}},
+		},
+	}
+	seen := map[pair]string{}
+	for name, spec := range want {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "schema", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed document
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		if len(parsed.Capabilities) != 1 {
+			t.Fatalf("%s capabilities = %d", name, len(parsed.Capabilities))
+		}
+		gotCap := parsed.Capabilities[0]
+		if gotCap.ID != spec.id || gotCap.Legacy.Engine != "cad" {
+			t.Fatalf("%s id %s engine %s", name, gotCap.ID, gotCap.Legacy.Engine)
+		}
+		if len(gotCap.Formats) != len(spec.pairs) {
+			t.Fatalf("%s formats = %d", name, len(gotCap.Formats))
+		}
+		got := map[pair]struct{}{}
+		for _, format := range gotCap.Formats {
+			got[format] = struct{}{}
+			if prev, ok := seen[format]; ok {
+				t.Fatalf("pair %s to %s in %s and %s", format.From, format.To, prev, name)
+			}
+			seen[format] = name
+		}
+		for _, format := range spec.pairs {
+			if _, ok := got[format]; !ok {
+				t.Fatalf("%s missing %s to %s", name, format.From, format.To)
+			}
+		}
+	}
+	if len(seen) != 8 {
+		t.Fatalf("pairs = %d", len(seen))
 	}
 }
 

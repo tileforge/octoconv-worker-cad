@@ -1,0 +1,44 @@
+# numpy==2.5.4 requires CPython >=3.12 and publishes no cp311 wheel.
+# cad-guard stays on Debian python3 in the engine stage.
+FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS venv
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN python3 -m venv /opt/venv
+COPY cmd/cad-worker/requirements-dxf.txt /req/requirements-dxf.txt
+RUN /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes \
+      -r /req/requirements-dxf.txt
+
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS engine
+ENV DEBIAN_FRONTEND=noninteractive CAD_STACK=drawing
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 librsvg2-bin fonts-dejavu-core ca-certificates \
+      libexpat1 libffi8 libssl3 zlib1g libbz2-1.0 liblzma5 libuuid1 \
+      libncursesw6 libreadline8 libsqlite3-0 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=venv /usr/local/bin/python3.12 /usr/local/bin/python3.12
+COPY --from=venv /usr/local/lib/libpython3.12.so.1.0 /usr/local/lib/libpython3.12.so.1.0
+COPY --from=venv /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=venv /opt/venv /opt/venv
+# Landlock grants the real interpreter inode. The venv's python3 link otherwise
+# points at /usr/local/bin/python3, a symlink that inode rule does not cover.
+RUN ln -sfn /usr/local/bin/python3.12 /opt/venv/bin/python3
+COPY cmd/cad-worker/helper/cad-guard /usr/local/bin/cad-guard
+COPY cmd/cad-worker/helper/cad-dxf /usr/local/bin/cad-dxf
+RUN chmod 0755 /usr/local/bin/cad-guard /usr/local/bin/cad-dxf
+RUN d=$(mktemp -d) \
+ && HOME="$d" XDG_CACHE_HOME="$d/.cache" XDG_CONFIG_HOME="$d/.config" \
+    /opt/venv/bin/python -I -B -c "import ezdxf, ezdxf.addons.drawing.frontend, ezdxf.addons.drawing.svg" \
+ && rm -rf "$d"
+RUN rsvg-convert --version
+USER nobody
+
+FROM golang:1.27.3-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/cad-worker ./cmd/cad-worker
+
+FROM engine
+COPY --from=build /out/cad-worker /usr/local/bin/cad-worker
+USER nobody
+ENTRYPOINT ["/usr/local/bin/cad-worker"]

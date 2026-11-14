@@ -65,8 +65,9 @@ var cadGuardEngines = []string{"cad-guard"}
 
 var cadDXFReadOnly = []string{
 	"/opt/venv",
-	"/usr/bin/python3.11",
-	"/usr/lib/python3.11",
+	"/usr/local/bin/python3.12",
+	"/usr/local/lib/libpython3.12.so.1.0",
+	"/usr/local/lib/python3.12",
 	"/usr/share/fonts",
 }
 
@@ -211,7 +212,7 @@ func CADPreflight(ctx context.Context, c CADConverter) error {
 		return err
 	}
 	defer cleanup()
-	if err := w.requireOutsideGrants(cadGuardReadOnly, cadMeshReadOnly, cadRenderReadOnly, cadDXFReadOnly, cadRsvgReadOnly, []string{"/usr/lib/" + triple}); err != nil {
+	if err := w.requireOutsideGrants(cadGuardReadOnly, cadMeshReadOnly, cadRenderReadOnly, []string{"/usr/lib/" + triple}); err != nil {
 		return err
 	}
 	inside, outside, err := w.place("in.step", cadPreflightSTEP)
@@ -256,9 +257,6 @@ func CADPreflight(ctx context.Context, c CADConverter) error {
 		return err
 	}
 	if err := cadPreflightRender(ctx, CADRenderConverter{c}, w, outInside); err != nil {
-		return err
-	}
-	if err := cadPreflightDrawing(ctx, c, w); err != nil {
 		return err
 	}
 
@@ -362,6 +360,25 @@ func cadPreflightRenderDenied(ctx context.Context, r CADRenderConverter, w prefl
 		return fmt.Errorf("the cad render stage read a file outside the job directory: confinement is not in effect: %w", err)
 	}
 	return nil
+}
+
+func CADPreflightDrawing(ctx context.Context, c CADConverter) error {
+	if !c.Sandbox.confines() {
+		return nil
+	}
+	triple, ok := cadMultiarchLib[runtime.GOARCH]
+	if !ok {
+		return fmt.Errorf("cad preflight: no multiarch library directory is known for GOARCH %s", runtime.GOARCH)
+	}
+	w, cleanup, err := newPreflightWorkspace("cad")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := w.requireOutsideGrants(cadDXFReadOnly, cadRsvgReadOnly, []string{"/usr/lib/" + triple}); err != nil {
+		return err
+	}
+	return cadPreflightDrawing(ctx, c, w)
 }
 
 func cadPreflightDrawing(ctx context.Context, c CADConverter, w preflightWorkspace) error {

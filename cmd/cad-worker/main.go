@@ -48,13 +48,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("cad sandbox: %v", err)
 	}
-	convert.Default.Replace(conv)
-	convert.Default.Replace(convert.CADRenderConverter{CADConverter: conv})
-	convert.Default.Replace(convert.CADDXFConverter{CADConverter: conv})
-	convert.Default.Replace(convert.CADDXFRenderConverter{CADConverter: conv})
+	preflight := convert.CADPreflight
+	switch os.Getenv("CAD_STACK") {
+	case "model":
+		convert.Default.Replace(conv)
+		convert.Default.Replace(convert.CADRenderConverter{CADConverter: conv})
+	case "drawing":
+		convert.Default.Replace(convert.CADDXFConverter{CADConverter: conv})
+		convert.Default.Replace(convert.CADDXFRenderConverter{CADConverter: conv})
+		preflight = convert.CADPreflightDrawing
+	default:
+		log.Fatalf("cad protocol: CAD_STACK must be model or drawing")
+	}
 
 	preflightCtx, cancelPreflight := context.WithTimeout(ctx, cadPreflightTimeout)
-	err = convert.CADPreflight(preflightCtx, conv)
+	err = preflight(preflightCtx, conv)
 	cancelPreflight()
 	if err != nil {
 		log.Fatalf("cad sandbox preflight: %v", err)
