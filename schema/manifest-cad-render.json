@@ -14,8 +14,7 @@
       "formats": [
         {"from": "step", "to": "png"},
         {"from": "iges", "to": "png"},
-        {"from": "stl", "to": "png"},
-        {"from": "dxf", "to": "png"}
+        {"from": "stl", "to": "png"}
       ]
     }
   ]

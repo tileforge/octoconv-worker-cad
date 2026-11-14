@@ -1,0 +1,37 @@
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS venv
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/venv
+COPY cmd/cad-worker/requirements-dxf.txt /req/requirements-dxf.txt
+RUN /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes \
+      -r /req/requirements-dxf.txt
+
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS engine
+ENV DEBIAN_FRONTEND=noninteractive CAD_STACK=drawing
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 librsvg2-bin fonts-dejavu-core ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=venv /opt/venv /opt/venv
+COPY cmd/cad-worker/helper/cad-guard /usr/local/bin/cad-guard
+COPY cmd/cad-worker/helper/cad-dxf /usr/local/bin/cad-dxf
+RUN chmod 0755 /usr/local/bin/cad-guard /usr/local/bin/cad-dxf
+RUN d=$(mktemp -d) \
+ && HOME="$d" XDG_CACHE_HOME="$d/.cache" XDG_CONFIG_HOME="$d/.config" \
+    /opt/venv/bin/python -I -B -c "import ezdxf, ezdxf.addons.drawing.frontend, ezdxf.addons.drawing.svg" \
+ && rm -rf "$d"
+RUN rsvg-convert --version
+USER nobody
+
+FROM golang:1.27.3-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/cad-worker ./cmd/cad-worker
+
+FROM engine
+COPY --from=build /out/cad-worker /usr/local/bin/cad-worker
+USER nobody
+ENTRYPOINT ["/usr/local/bin/cad-worker"]
