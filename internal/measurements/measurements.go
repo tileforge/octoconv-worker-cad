@@ -30,6 +30,9 @@ const (
 	ReasonSTLNotWatertight   = "stl_not_watertight"
 	ReasonSTLAmbiguousShells = "stl_ambiguous_shells"
 	ReasonNotApplicable2D    = "not_applicable_2d"
+	FindingSTLOpen           = "stl_open"
+	FindingSTLNonManifold    = "stl_non_manifold"
+	FindingSTLUnoriented     = "stl_unoriented"
 	FormatSTEP               = "step"
 	FormatIGES               = "iges"
 	FormatSTL                = "stl"
@@ -39,10 +42,11 @@ const (
 var ErrInvalid = errors.New("invalid measurements document")
 
 var (
-	units       = []string{UnitMM, UnitCM, UnitM, UnitInch, UnitFoot, UnitMicrometre, UnitUnspecified}
-	unitSources = []string{SourceDeclared, SourceClientAssumed, SourceNone}
-	nullReasons = []string{ReasonNoSolids, ReasonOpenShell, ReasonInvalidSolid, ReasonNegativeVolume, ReasonSTLNotWatertight, ReasonSTLAmbiguousShells, ReasonNotApplicable2D}
-	formats     = []string{FormatSTEP, FormatIGES, FormatSTL, FormatDXF}
+	units        = []string{UnitMM, UnitCM, UnitM, UnitInch, UnitFoot, UnitMicrometre, UnitUnspecified}
+	unitSources  = []string{SourceDeclared, SourceClientAssumed, SourceNone}
+	nullReasons  = []string{ReasonNoSolids, ReasonOpenShell, ReasonInvalidSolid, ReasonNegativeVolume, ReasonSTLNotWatertight, ReasonSTLAmbiguousShells, ReasonNotApplicable2D}
+	formats      = []string{FormatSTEP, FormatIGES, FormatSTL, FormatDXF}
+	meshFindings = []string{FindingSTLOpen, FindingSTLNonManifold, FindingSTLUnoriented}
 )
 
 var reasonsByFormat = map[string][]string{
@@ -59,10 +63,11 @@ var cadCountRules = map[string]func(solids, closed int) bool{
 	ReasonNegativeVolume: func(solids, closed int) bool { return closed > 0 },
 }
 
-func AllUnits() []string       { return slices.Clone(units) }
-func AllUnitSources() []string { return slices.Clone(unitSources) }
-func AllNullReasons() []string { return slices.Clone(nullReasons) }
-func AllFormats() []string     { return slices.Clone(formats) }
+func AllUnits() []string        { return slices.Clone(units) }
+func AllUnitSources() []string  { return slices.Clone(unitSources) }
+func AllNullReasons() []string  { return slices.Clone(nullReasons) }
+func AllFormats() []string      { return slices.Clone(formats) }
+func AllMeshFindings() []string { return slices.Clone(meshFindings) }
 
 type BBox struct {
 	Min []float64 `json:"min"`
@@ -81,6 +86,7 @@ type Document struct {
 	VolumeNullReason string   `json:"volume_null_reason,omitempty"`
 	Area             *float64 `json:"area"`
 	AreaNullReason   string   `json:"area_null_reason,omitempty"`
+	MeshFindings     []string `json:"mesh_findings,omitempty"`
 }
 
 func invalid(field, format string, args ...any) error {
@@ -115,6 +121,9 @@ func Validate(raw []byte) (Document, error) {
 		if v, ok := keys[k]; ok && string(v) == `""` {
 			return Document{}, invalid(k, "empty reason")
 		}
+	}
+	if v, ok := keys["mesh_findings"]; ok && string(v) == "null" {
+		return Document{}, invalid("mesh_findings", "null")
 	}
 	for _, k := range []string{"solids", "closed_solids"} {
 		_, present := keys[k]
@@ -206,6 +215,38 @@ func (d Document) Validate() error {
 	}
 	if d.Volume == nil && d.VolumeNullReason != d.AreaNullReason {
 		return invalid("area_null_reason", "%q differs from volume_null_reason %q: both describe the same shape", d.AreaNullReason, d.VolumeNullReason)
+	}
+	if err := d.validateMeshFindings(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d Document) validateMeshFindings() error {
+	if len(d.MeshFindings) == 0 {
+		if d.MeshFindings != nil {
+			return invalid("mesh_findings", "empty")
+		}
+		return nil
+	}
+	if d.Format != FormatSTL {
+		return invalid("mesh_findings", "not allowed for format %s", d.Format)
+	}
+	prev := -1
+	seen := make(map[string]bool, len(d.MeshFindings))
+	for _, code := range d.MeshFindings {
+		i := slices.Index(meshFindings, code)
+		if i < 0 {
+			return invalid("mesh_findings", "%q is not in the vocabulary", code)
+		}
+		if seen[code] {
+			return invalid("mesh_findings", "duplicate %q", code)
+		}
+		if i < prev {
+			return invalid("mesh_findings", "not in canonical order")
+		}
+		seen[code] = true
+		prev = i
 	}
 	return nil
 }
