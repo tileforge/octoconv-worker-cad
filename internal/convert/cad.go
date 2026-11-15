@@ -31,7 +31,10 @@ const (
 	CADDefaultMeshTimeout   = 324 * time.Second
 	CADDefaultRenderTimeout = 521 * time.Second
 	CADIOAllowance          = 20 * time.Second
-	CADDefaultEngineTimeout = max(CADDefaultGuardTimeout+CADDefaultMeshTimeout+CADDefaultRenderTimeout+CADIOAllowance, CADDefaultGuardTimeout+CADDefaultDXFTimeout+2*CADDefaultRsvgTimeout+CADIOAllowance)
+	CADDefaultEngineTimeout = max(
+		CADDefaultGuardTimeout+CADDefaultMeshTimeout+CADDefaultRenderTimeout+CADIOAllowance,
+		CADDefaultGuardTimeout+CADDefaultDXFTimeout+2*CADDefaultRsvgTimeout+CADIOAllowance,
+		CADDefaultGuardTimeout+CADDefaultDWGTimeout+CADDefaultDXFTimeout+2*CADDefaultRsvgTimeout+CADIOAllowance)
 
 	CADMaxDXFBytes            = 118 << 20
 	CADMaxDXFExpandedInserts  = 170031
@@ -40,6 +43,7 @@ const (
 	CADMaxDXFSVGBytes         = 134 << 20
 	CADMaxDXFPDFBytes         = 19 << 20
 	CADDefaultDXFTimeout      = 186 * time.Second
+	CADDefaultDWGTimeout      = 186 * time.Second
 	CADDefaultRsvgTimeout     = 217 * time.Second
 
 	cadOutputLimit   = 1 << 20
@@ -48,6 +52,7 @@ const (
 	cadStageMesh     = "mesh"
 	cadStageRender   = "render"
 	cadStageDXF      = "dxf"
+	cadStageDWG      = "dwg"
 	cadStageRsvg     = "rsvg"
 	cadStageInk      = "ink"
 	cadStageJudge    = "judge"
@@ -70,6 +75,7 @@ var (
 	ErrCADMeasurementsInvalid = errors.New("cad: the measurements could not be produced")
 
 	ErrCADDXFTimeout      = errors.New("cad: the dxf stage did not finish within the time limit")
+	ErrCADDWGTimeout      = errors.New("cad: the dwg took too long to read; simplify the drawing or export fewer details")
 	ErrCADRsvgTimeout     = errors.New("cad: the rsvg stage did not finish within the time limit")
 	ErrCADDrawingFailed   = errors.New("cad: the drawing stage failed")
 	ErrCADNothingDrawable = errors.New("cad: the drawing has nothing drawable")
@@ -81,6 +87,7 @@ type CADConverter struct {
 	MeshTimeout   time.Duration
 	RenderTimeout time.Duration
 	DXFTimeout    time.Duration
+	DWGTimeout    time.Duration
 	RsvgTimeout   time.Duration
 }
 
@@ -128,6 +135,13 @@ func (c CADConverter) dxfTimeout() time.Duration {
 		return c.DXFTimeout
 	}
 	return CADDefaultDXFTimeout
+}
+
+func (c CADConverter) dwgTimeout() time.Duration {
+	if c.DWGTimeout > 0 {
+		return c.DWGTimeout
+	}
+	return CADDefaultDWGTimeout
 }
 
 func (c CADConverter) rsvgTimeout() time.Duration {
@@ -351,6 +365,9 @@ func classifyCADStage(stage string, parent, stageCtx context.Context, timeout ti
 		case cadStageDXF:
 			return cadVerdict{}, fmt.Errorf("cad dxf: %w: no result within %s, engine cpu %.1fs: %v",
 				ErrCADDXFTimeout, timeout, cpu.Total().Seconds(), err)
+		case cadStageDWG:
+			return cadVerdict{}, fmt.Errorf("cad dwg: %w: no result within %s, engine cpu %.1fs: %v",
+				ErrCADDWGTimeout, timeout, cpu.Total().Seconds(), err)
 		}
 		return cadVerdict{}, fmt.Errorf("cad %s: no verdict within the %s stage deadline: %w", stage, timeout, err)
 	}

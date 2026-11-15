@@ -1,0 +1,8 @@
+[package]
+name = "cad-dwg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+acadrust = { version = "0.6.8", default-features = false }

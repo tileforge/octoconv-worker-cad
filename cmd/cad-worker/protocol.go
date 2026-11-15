@@ -59,7 +59,7 @@ func cadEngineCode(err error) string {
 		return "input_too_large"
 	case errors.Is(err, convert.ErrCADTooComplex), errors.Is(err, convert.ErrCADEngineKilled),
 		errors.Is(err, convert.ErrCADRenderTimeout), errors.Is(err, convert.ErrCADDXFTimeout),
-		errors.Is(err, convert.ErrCADRsvgTimeout):
+		errors.Is(err, convert.ErrCADDWGTimeout), errors.Is(err, convert.ErrCADRsvgTimeout):
 		return "cad_too_complex"
 	case errors.Is(err, convert.ErrCADUnreadable):
 		return "cad_unreadable"

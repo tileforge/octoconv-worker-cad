@@ -42,6 +42,7 @@ func main() {
 		envDuration("CAD_MESH_TIMEOUT", convert.CADDefaultMeshTimeout),
 		envDuration("CAD_RENDER_TIMEOUT", convert.CADDefaultRenderTimeout),
 		envDuration("CAD_DXF_TIMEOUT", convert.CADDefaultDXFTimeout),
+		envDuration("CAD_DWG_TIMEOUT", convert.CADDefaultDWGTimeout),
 		envDuration("CAD_RSVG_TIMEOUT", convert.CADDefaultRsvgTimeout),
 		envDuration("CAD_ENGINE_TIMEOUT", convert.CADDefaultEngineTimeout),
 	)

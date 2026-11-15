@@ -30,7 +30,10 @@ var cadDXFJobNames = []string{cadDXFDrawName, cadDXFRenderName, cadDXFTextsName,
 type CADDXFConverter struct{ CADConverter }
 
 func (CADDXFConverter) Pairs() []Pair {
-	return []Pair{{From: "dxf", To: "svg"}, {From: "dxf", To: "pdf"}}
+	return []Pair{
+		{From: "dxf", To: "svg"}, {From: "dxf", To: "pdf"},
+		{From: "dwg", To: "svg"}, {From: "dwg", To: "pdf"}, {From: "dwg", To: "png"},
+	}
 }
 
 type cadDXFDrawing struct {
@@ -50,14 +53,17 @@ func (c CADDXFConverter) ConvertWithStages(ctx context.Context, inPath, outPath 
 	}
 	format := NormalizeFormat(filepath.Ext(inPath))
 	target := NormalizeFormat(filepath.Ext(outPath))
-	if format != "dxf" || (target != "svg" && target != "pdf") {
+	switch {
+	case (format == "dxf" || format == "dwg") && (target == "svg" || target == "pdf"):
+	case format == "dwg" && target == "png":
+	default:
 		return fmt.Errorf("cad: unsupported conversion %s -> %s", format, target)
 	}
 	if err := ValidateCADApplicability(EngineCAD, OperationConvert, format, target, parsed); err != nil {
 		return fmt.Errorf("cad: %w", err)
 	}
-	st := newCADStager(sink, OperationConvert, "dxf", target)
-	jobDir, err := cadDXFAdmit(inPath, outPath)
+	st := newCADStager(sink, OperationConvert, format, target)
+	jobDir, inPath, err := c.openDrawing(ctx, inPath, outPath, format, st)
 	if err != nil {
 		return err
 	}
@@ -66,11 +72,18 @@ func (c CADDXFConverter) ConvertWithStages(ctx context.Context, inPath, outPath 
 		if err != nil {
 			os.Remove(outPath)
 			os.Remove(clean)
+			if format == "dwg" {
+				os.Remove(inPath)
+			}
 		}
 	}()
 
 	if target == "svg" {
 		_, err = c.dxfDrawing(ctx, jobDir, inPath, outPath, "", st)
+		return err
+	}
+	if target == "png" {
+		err = c.writeDrawingPNG(ctx, jobDir, inPath, outPath, st)
 		return err
 	}
 	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", "", st)
@@ -94,12 +107,44 @@ func (c CADDXFConverter) ConvertWithStages(ctx context.Context, inPath, outPath 
 	return nil
 }
 
+func (c CADDXFConverter) writeDrawingPNG(ctx context.Context, jobDir, inPath, outPath string, st cadStager) error {
+	o := CADOpts{}.Resolved()
+	size := *o.Size
+	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", "", st)
+	if err != nil {
+		return err
+	}
+	box, err := CADDrawingLetterbox(d.render.WidthMM, d.render.HeightMM, size)
+	if err != nil {
+		return fmt.Errorf("cad dxf: %w: %v", ErrCADSVGRejected, err)
+	}
+	clean := filepath.Join(jobDir, cadDXFCleanName)
+	if err := cadDXFClear(outPath); err != nil {
+		return err
+	}
+	st.enter(cadStageRsvg)
+	if err := c.rsvgStage(ctx, jobDir, outPath, cadDXFFrameArgs(o.Background, box, size, outPath, clean)...); err != nil {
+		return err
+	}
+	st.enter(cadStageJudge)
+	if err := cadDXFRegular(outPath, "the PNG", ErrCADDrawingFailed); err != nil {
+		return err
+	}
+	f, _, err := OpenJobFile(outPath)
+	if err != nil {
+		return fmt.Errorf("cad: %w: no image at %s: %v", ErrCADRenderRejected, outPath, err)
+	}
+	_, err = JudgeCADDrawingPNG(f, size, o.Background, box)
+	f.Close()
+	return err
+}
+
 type CADDXFRenderConverter struct{ CADConverter }
 
 func (CADDXFRenderConverter) Operation() string { return OperationRender }
 
 func (CADDXFRenderConverter) Pairs() []Pair {
-	return []Pair{{From: "dxf", To: "png"}}
+	return []Pair{{From: "dxf", To: "png"}, {From: "dwg", To: "png"}}
 }
 
 func (c CADDXFRenderConverter) Convert(ctx context.Context, inPath, outPath string, opts map[string]any) error {
@@ -113,7 +158,7 @@ func (c CADDXFRenderConverter) ConvertWithStages(ctx context.Context, inPath, ou
 	}
 	format := NormalizeFormat(filepath.Ext(inPath))
 	target := NormalizeFormat(filepath.Ext(outPath))
-	if format != "dxf" || target != "png" {
+	if (format != "dxf" && format != "dwg") || target != "png" {
 		return fmt.Errorf("cad: unsupported render %s -> %s", format, target)
 	}
 	if err := ValidateCADApplicability(EngineCAD, OperationRender, format, target, parsed); err != nil {
@@ -121,8 +166,8 @@ func (c CADDXFRenderConverter) ConvertWithStages(ctx context.Context, inPath, ou
 	}
 	o := parsed.Resolved()
 	size := *o.Size
-	st := newCADStager(sink, OperationRender, "dxf", "png")
-	jobDir, err := cadDXFAdmit(inPath, outPath)
+	st := newCADStager(sink, OperationRender, format, "png")
+	jobDir, inPath, err := c.openDrawing(ctx, inPath, outPath, format, st)
 	if err != nil {
 		return err
 	}
@@ -133,6 +178,9 @@ func (c CADDXFRenderConverter) ConvertWithStages(ctx context.Context, inPath, ou
 			os.Remove(outPath)
 			os.Remove(clean)
 			os.Remove(sidecar)
+			if format == "dwg" {
+				os.Remove(inPath)
+			}
 		}
 	}()
 
@@ -213,9 +261,10 @@ func cadDXFFrameArgs(background string, box CADLetterbox, size int, out, in stri
 		"-o", out, in)
 }
 
-func cadDXFAdmit(inPath, outPath string) (string, error) {
+func cadDXFNames(inPath, outPath string, extra ...string) (string, error) {
 	jobDir := filepath.Dir(outPath)
-	for _, name := range cadDXFJobNames {
+	names := append(append([]string{}, cadDXFJobNames...), extra...)
+	for _, name := range names {
 		p := filepath.Join(jobDir, name)
 		if filepath.Clean(inPath) == p {
 			return "", fmt.Errorf("cad: the input %s is the %s path of its own job", inPath, name)
@@ -223,6 +272,14 @@ func cadDXFAdmit(inPath, outPath string) (string, error) {
 		if filepath.Clean(outPath) == p {
 			return "", fmt.Errorf("cad: the output %s is the %s path of its own job", outPath, name)
 		}
+	}
+	return jobDir, nil
+}
+
+func cadDXFAdmit(inPath, outPath string) (string, error) {
+	jobDir, err := cadDXFNames(inPath, outPath)
+	if err != nil {
+		return "", err
 	}
 	info, err := os.Stat(inPath)
 	if err != nil {
