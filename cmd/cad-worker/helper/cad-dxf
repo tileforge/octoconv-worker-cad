@@ -226,6 +226,9 @@ def promote_viewreps(doc):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
             attribs[attr] = float(value)
+        visibility = tag_value(entity, 60)
+        if isinstance(visibility, int) and not isinstance(visibility, bool) and visibility != 0:
+            attribs["invisible"] = 1
         doc.modelspace().add_blockref(name, raw, dxfattribs=attribs)
 
 
@@ -337,6 +340,16 @@ def draw(doc, max_drawn, state):
     from ezdxf.entities.dxfentity import DXFTagStorage
     from ezdxf.math import BoundingBox2d, Matrix44, Vec2
     from ezdxf.math.clipping import ClippingRect2d
+    from ezdxf.npshapes import NumpyPoints2d
+
+    def portal_matrix(portal):
+        # ezdxf 1.4.5 keeps each model-to-paper transform on a private clipping stage.
+        placed = Matrix44()
+        for stage in reversed(portal._stages):
+            transform = stage.transform
+            if transform is not None:
+                placed = transform @ placed
+        return placed
 
     texts = []
     infinite = []
@@ -397,6 +410,24 @@ def draw(doc, max_drawn, state):
                 p.transform_inplace(transform)
                 if len(p):
                     box.extend(p.extents())
+            placed = Matrix44(transform)
+            clip = None
+            portal = self.clipping_portal
+            if portal.is_active:
+                placed = portal_matrix(portal) @ placed
+                if box.has_data:
+                    kept = []
+                    paper = BoundingBox2d()
+                    for poly in portal.clip_polygon(NumpyPoints2d(box.rect_vertices())):
+                        pts = [(float(v.x), float(v.y)) for v in poly.vertices()]
+                        if len(pts) < 3:
+                            continue
+                        kept.append(pts)
+                        paper.extend(pts)
+                    if not kept:
+                        return
+                    box = paper
+                    clip = kept
             fonts = faces.get(id(gc.font))
             if fonts is None:
                 fonts = faces[id(gc.font)] = font_attrs(gc.font)
@@ -414,6 +445,7 @@ def draw(doc, max_drawn, state):
                 "font": fonts[1],
                 "color": self.get_backend_properties(properties).color,
                 "box": box,
+                "clip": clip,
             })
             if TEXT_AS_OUTLINE:
                 RenderPipeline2d.draw_text(self, text, transform, properties, cap_height, dxftype)
@@ -492,7 +524,33 @@ def draw(doc, max_drawn, state):
         def draw_entities_callback(self, ctx, entities):
             if self.limit_views and self.viewport is not None:
                 entities = entities_at_view(self.viewport, entities)
-            _draw_entities(self, ctx, entities, filter_func=keep)
+            previous = self.ctx
+            self.ctx = ctx
+            try:
+                _draw_entities(self, ctx, entities, filter_func=keep)
+            finally:
+                self.ctx = previous
+
+        def draw_clipped_infinite(self, entity, properties):
+            start = Vec2(entity.dxf.start)
+            direction = Vec2(entity.dxf.unit_vector)
+            if direction.is_null:
+                return
+            d = direction.normalize()
+            reach = 1.0
+            if self.viewport is not None:
+                try:
+                    limits = self.viewport.get_modelspace_limits()
+                except (AttributeError, ValueError, ZeroDivisionError):
+                    limits = None
+                if limits is not None:
+                    for x, y in ((limits[0], limits[1]), (limits[0], limits[3]), (limits[2], limits[1]), (limits[2], limits[3])):
+                        reach = max(reach, math.hypot(x - start.x, y - start.y))
+            else:
+                reach = 1.0e6
+            kind = entity.dxftype()
+            a = start - d * (reach + 1.0) if kind == "XLINE" else start
+            self.pipeline.draw_line(a, start + d * (reach + 1.0), properties)
 
         def draw_entity(self, entity, properties):
             state["entities_drawn"] += 1
@@ -524,6 +582,9 @@ def draw(doc, max_drawn, state):
         def draw_line_entity(self, entity, properties):
             kind = entity.dxftype()
             if kind in INFINITE_LINES:
+                if self.pipeline.clipping_portal.is_active:
+                    self.draw_clipped_infinite(entity, properties)
+                    return
                 infinite.append((kind, Vec2(entity.dxf.start), Vec2(entity.dxf.unit_vector), properties))
                 return
             super().draw_line_entity(entity, properties)
@@ -606,7 +667,27 @@ def draw(doc, max_drawn, state):
         size = t["em"] * k
         if k <= 0.0 or size <= 0.0:
             continue
-        el = ET.SubElement(group, "text")
+        parent = group
+        polygons = t["clip"]
+        if polygons:
+            defs = root.find("defs")
+            if defs is None:
+                defs = ET.Element("defs")
+                root.insert(0, defs)
+            clip = ET.SubElement(defs, "clipPath")
+            clip_id = "tclip%d" % len(defs)
+            clip.set("id", clip_id)
+            for poly in polygons:
+                points = []
+                for x, y in poly:
+                    v = T.transform((x, y, 0))
+                    points.append("%.6g,%.6g" % (v.x, v.y))
+                if len(points) >= 3:
+                    el = ET.SubElement(clip, "polygon")
+                    el.set("points", " ".join(points))
+            parent = ET.SubElement(group, "g")
+            parent.set("clip-path", "url(#%s)" % clip_id)
+        el = ET.SubElement(parent, "text")
         el.set("transform", "matrix(%s)" % " ".join("%.6g" % v for v in (
             m[0, 0] / k, m[0, 1] / k, m[1, 0] / k, m[1, 1] / k, m[3, 0], m[3, 1])))
         el.set("font-family", t["family"])
