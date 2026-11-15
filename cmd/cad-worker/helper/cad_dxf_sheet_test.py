@@ -7,7 +7,7 @@ import ezdxf
 cad = SourceFileLoader("caddxf", str(Path(__file__).with_name("cad-dxf"))).load_module()
 
 
-def viewrep(name, point, layer="0"):
+def viewrep(name, point, layer="0", invisible=0):
     lines = [
         "0", "ACDBVIEWREPBLOCKREFERENCE",
         "8", layer,
@@ -18,6 +18,8 @@ def viewrep(name, point, layer="0"):
         "20", str(point[1]),
         "30", "0.0",
     ]
+    if invisible:
+        lines.extend(["60", "1"])
     return "\n".join(lines) + "\n"
 
 
@@ -132,7 +134,135 @@ def main():
         shifted.dxf.view_center_point = (-10054.25, -10045.25)
         if owned(shifted) != ["ACDBVIEWREPBLOCKREFERENCE", "TOP"]:
             raise SystemExit("target offset owns %s" % owned(shifted))
+
+        hidden_path = str(Path(tmp) / "hidden.dxf")
+        save_with_viewrep(sheet_doc(), hidden_path, [("PART", (5.0, 6.0), "0", 1)])
+        hidden = ezdxf.readfile(hidden_path)
+        cad.promote_viewreps(hidden)
+        hidden_inserts = [e for e in hidden.modelspace() if e.dxftype() == "INSERT"]
+        if len(hidden_inserts) != 1 or hidden_inserts[0].dxf.invisible != 1:
+            raise SystemExit("invisible view-rep was promoted as visible")
+
+        shown = draw_copy(sheet_doc(), tmp, "shown-part", [("PART", (5.0, 6.0))])
+        concealed = draw_copy(sheet_doc(), tmp, "concealed-part", [("PART", (5.0, 6.0), "0", 1)])
+        if path_count(concealed[1]) >= path_count(shown[1]):
+            raise SystemExit("invisible view-rep still drew the block")
+
+        open_draw = draw_copy(hidden_line_doc(), tmp, "layer-open", [("PART", (5.0, 6.0))])
+        frozen_draw = draw_copy(hidden_line_doc(), tmp, "layer-frozen", [("PART", (5.0, 6.0))], freeze="HIDE")
+        if frozen_draw[0]["entities_drawn"] >= open_draw[0]["entities_drawn"]:
+            raise SystemExit("viewport-frozen layer was drawn")
+        if path_count(frozen_draw[1]) >= path_count(open_draw[1]):
+            raise SystemExit("viewport-frozen layer left ink")
+
+        text_draw = draw_copy(far_text_doc(), tmp, "far-text", [("TOP", (-10053.25, -10043.25))])
+        if span(text_draw[2]) > 1000:
+            raise SystemExit("text frame uses model coordinates: %s" % (text_draw[2],))
+        if [e["text"] for e in text_draw[3]] != ["Hi"]:
+            raise SystemExit("sheet text %s" % [e["text"] for e in text_draw[3]])
+        text_el = text_draw[3][0]["el"]
+        parents = {child: parent for parent in text_draw[1].iter() for child in parent}
+        if parents[text_el].get("clip-path") is None:
+            raise SystemExit("viewport text has no clip")
+
+        plain = draw_copy(far_curve_doc(False), tmp, "far-plain", [("TOP", (-10053.25, -10043.25))])
+        crossed = draw_copy(far_curve_doc(True), tmp, "far-xline", [("TOP", (-10053.25, -10043.25))])
+        if span(crossed[2]) > 1000:
+            raise SystemExit("xline frame uses model coordinates: %s" % (crossed[2],))
+        if path_count(crossed[1]) <= path_count(plain[1]):
+            raise SystemExit("viewport xline produced no path")
+
+        model = ezdxf.new("R2018", setup=True)
+        model.modelspace().add_line((0, 0), (10, 0))
+        model.modelspace().add_text("Ok", dxfattribs={"insert": (1, 1), "height": 2})
+        model.modelspace().add_xline((0, 0), (1, 0))
+        model_state = cad.new_state()
+        model_root, model_box, model_emitted = cad.draw(model, 1000, model_state)
+        if [e["text"] for e in model_emitted] != ["Ok"]:
+            raise SystemExit("model text %s" % [e["text"] for e in model_emitted])
+        if span(model_box) > 1000:
+            raise SystemExit("model frame %s" % (model_box,))
+        parents = {child: parent for parent in model_root.iter() for child in parent}
+        if parents[model_emitted[0]["el"]].get("clip-path"):
+            raise SystemExit("model text was clipped to a viewport")
+        if path_count(model_root) < 2:
+            raise SystemExit("model xline produced no path")
     print("ok")
+
+
+def draw_copy(doc, tmp, name, reps, freeze=""):
+    path = str(Path(tmp) / (name + ".dxf"))
+    save_with_viewrep(doc, path, reps)
+    loaded = ezdxf.readfile(path)
+    if freeze:
+        sheet = loaded.layouts.get("Sheet")
+        for entity in sheet:
+            if entity.dxftype() == "VIEWPORT" and entity.dxf.status > 1:
+                entity.frozen_layers = [freeze]
+    state = cad.new_state()
+    root, box, emitted = cad.draw(loaded, 1000, state)
+    return state, root, box, emitted
+
+
+def span(box):
+    (lo, hi) = box
+    return max(hi[0] - lo[0], hi[1] - lo[1])
+
+
+def path_count(root):
+    return sum(1 for el in root.iter() if str(el.tag).endswith("path"))
+
+
+def hidden_line_doc():
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("HIDE")
+    block = doc.blocks.new("PART")
+    block.add_circle((0, 0), radius=2)
+    block.add_line((-4, -1), (4, 1), dxfattribs={"layer": "HIDE"})
+    sheet = doc.layouts.new("Sheet")
+    sheet.add_line((0, 0), (200, 0))
+    sheet.add_viewport(
+        center=(100, 80),
+        size=(60, 40),
+        view_center_point=(5, 6),
+        view_height=20,
+        status=2,
+    )
+    return doc
+
+
+def far_sheet(doc):
+    sheet = doc.layouts.new("Sheet")
+    sheet.add_line((0, 0), (200, 0))
+    sheet.add_viewport(
+        center=(100, 120),
+        size=(80, 90),
+        view_center_point=(-10053.25, -10043.25),
+        view_height=50,
+        status=2,
+    )
+    return doc
+
+
+def far_text_doc():
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = 4
+    block = doc.blocks.new("TOP")
+    block.add_circle((0, 0), radius=4)
+    block.add_text("Hi", dxfattribs={"insert": (0, 0), "height": 3})
+    return far_sheet(doc)
+
+
+def far_curve_doc(with_xline):
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = 4
+    block = doc.blocks.new("TOP")
+    block.add_circle((0, 0), radius=4)
+    if with_xline:
+        block.add_xline((0, 0), (1, 0))
+        block.add_ray((0, 0), (0, 1))
+    return far_sheet(doc)
 
 
 def close_views():
