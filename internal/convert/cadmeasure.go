@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	cadMeasureDraftMaxBytes = 64 << 10
+	cadMeasureDraftMaxBytes = 1 << 20
 	cadFactorTolerance      = 1e-9
 )
 

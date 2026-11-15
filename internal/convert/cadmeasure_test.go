@@ -1,10 +1,13 @@
 package convert
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tileforge/octoconv-worker-cad/internal/measurements"
@@ -132,6 +135,62 @@ func TestDraftRejectsTheNewFieldsOnTheWrongFormat(t *testing.T) {
 	bad.Bodies = []cadMeasureBody{{BBox: measurements.BBox{Min: []float64{nan, 0, 0}, Max: []float64{1, 1, 1}}}}
 	if err := bad.checkFinite(); err == nil || !errors.Is(err, ErrCADMeasure) {
 		t.Fatalf("non-finite body: %v", err)
+	}
+}
+
+func TestDraftAcceptsTwoThousandSolidBoxes(t *testing.T) {
+	const solids = 2000
+	corner := measurements.MaxAbsCoordinate
+	box := measurements.BBox{
+		Min: []float64{-corner, -corner, -corner},
+		Max: []float64{corner, corner, corner},
+	}
+	bodies := make([]cadMeasureBody, solids)
+	for i := range bodies {
+		bodies[i].BBox = box
+	}
+	one := 1.0
+	raw, err := json.Marshal(cadMeasureDraft{
+		Format:          measurements.FormatSTEP,
+		DeclaredUnit:    measurements.UnitMM,
+		DeclaredUnitRaw: "mm",
+		AppliedFactor:   &one,
+		BBox:            box,
+		Solids:          intPtr(solids),
+		ClosedSolids:    intPtr(solids),
+		Volume:          floatPtr(1),
+		Area:            floatPtr(1),
+		Triangles:       solids * 12,
+		Bodies:          bodies,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= 64<<10 {
+		t.Fatalf("draft is %d bytes, the previous 64 KiB budget still fits it", len(raw))
+	}
+	parsed, err := parseCADMeasureDraft(writeDraft(t, string(raw)))
+	if err != nil {
+		t.Fatalf("parse %d bytes: %v", len(raw), err)
+	}
+	doc, err := buildCADMeasurements(parsed, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Bodies) != solids {
+		t.Fatalf("bodies = %d", len(doc.Bodies))
+	}
+	if err := doc.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDraftRejectsOneBytePastTheBudget(t *testing.T) {
+	raw := strings.Repeat("x", cadMeasureDraftMaxBytes+1)
+	_, err := parseCADMeasureDraft(writeDraft(t, raw))
+	want := fmt.Sprintf("draft is larger than %d bytes", cadMeasureDraftMaxBytes)
+	if err == nil || !errors.Is(err, ErrCADMeasure) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("oversize: %v", err)
 	}
 }
 
