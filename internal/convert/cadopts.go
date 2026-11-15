@@ -11,6 +11,7 @@ const (
 	CADMinRenderSize     = 256
 	CADMaxRenderSize     = 2048
 	CADDefaultRenderSize = 1280
+	CADMaxLayoutName     = 255
 
 	CADViewIso       = "iso"
 	CADQualityStd    = "standard"
@@ -34,6 +35,7 @@ type CADOpts struct {
 	Background string `json:"background,omitempty"`
 	AssumeUnit string `json:"assume_unit,omitempty"`
 	Dimensions *bool  `json:"dimensions,omitempty"`
+	Layout     string `json:"layout,omitempty"`
 }
 
 func ParseCADOpts(raw []byte) (CADOpts, error) {
@@ -86,6 +88,12 @@ func ParseCADOpts(raw []byte) (CADOpts, error) {
 				return CADOpts{}, fmt.Errorf("parse opts: dimensions: %w", err)
 			}
 			o.Dimensions = &enabled
+		case "layout":
+			s, err := cadLayout(value)
+			if err != nil {
+				return CADOpts{}, err
+			}
+			o.Layout = s
 		default:
 			return CADOpts{}, fmt.Errorf("parse opts: unknown option %q", key)
 		}
@@ -117,6 +125,25 @@ func cadSize(raw json.RawMessage) (int, error) {
 		return 0, fmt.Errorf("size %d is outside %d..%d", n, CADMinRenderSize, CADMaxRenderSize)
 	}
 	return n, nil
+}
+
+func cadLayout(raw json.RawMessage) (string, error) {
+	var s string
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", fmt.Errorf("parse opts: layout must be a string")
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", fmt.Errorf("parse opts: layout: %w", err)
+	}
+	if s == "" || len([]rune(s)) > CADMaxLayoutName {
+		return "", fmt.Errorf("layout must be 1 to %d characters", CADMaxLayoutName)
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("layout must not contain control characters")
+		}
+	}
+	return s, nil
 }
 
 func CADOptsFromMap(m map[string]any) (CADOpts, error) {
@@ -162,10 +189,16 @@ func ValidateCADApplicability(engine, operation, source, target string, o CADOpt
 	if engine != EngineCAD {
 		return fmt.Errorf("cad options are only valid for cad-engine conversions")
 	}
-	if format := NormalizeFormat(source); format == "dxf" || format == "dwg" {
+	format := NormalizeFormat(source)
+	if format == "dxf" || format == "dwg" {
 		switch {
 		case operation == OperationConvert:
-			return fmt.Errorf("no option applies to a %s conversion", format)
+			other := o
+			other.Layout = ""
+			if !other.isZero() {
+				return fmt.Errorf("only layout applies to a %s conversion", format)
+			}
+			return nil
 		case operation == OperationRender && o.View != "":
 			return fmt.Errorf("view does not apply to a %s source", format)
 		case operation == OperationRender && o.Quality != "":
@@ -173,6 +206,8 @@ func ValidateCADApplicability(engine, operation, source, target string, o CADOpt
 		case operation == OperationRender && o.Dimensions != nil:
 			return fmt.Errorf("dimensions does not apply to a %s source", format)
 		}
+	} else if o.Layout != "" {
+		return fmt.Errorf("layout does not apply to a %s source", format)
 	}
 	switch operation {
 	case OperationConvert:

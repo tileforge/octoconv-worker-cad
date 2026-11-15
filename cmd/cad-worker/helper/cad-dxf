@@ -320,6 +320,18 @@ def sole_sheet(doc):
     return sheets[0]
 
 
+def named_layout(doc, name):
+    if name == "Model":
+        raise Outcome("failed", "unknown_layout", EXIT_FAILED)
+    try:
+        found = doc.layouts.get(name)
+    except KeyError:
+        raise Outcome("failed", "unknown_layout", EXIT_FAILED)
+    if found is None or found.name == "Model":
+        raise Outcome("failed", "unknown_layout", EXIT_FAILED)
+    return found
+
+
 def padded_frame(frame, BoundingBox2d):
     w = frame.size.x
     h = frame.size.y
@@ -332,7 +344,7 @@ def padded_frame(frame, BoundingBox2d):
     return BoundingBox2d([(cx - w / 2.0, cy - h / 2.0), (cx + w / 2.0, cy + h / 2.0)]), w, h
 
 
-def draw(doc, max_drawn, state):
+def draw(doc, max_drawn, state, layout_name=""):
     from ezdxf.addons.drawing import Frontend, RenderContext, config, layout, svg
     from ezdxf.addons.drawing.frontend import UniversalFrontend, _draw_entities
     from ezdxf.addons.drawing.pipeline import RenderPipeline2d, prepare_string_for_rendering
@@ -602,7 +614,12 @@ def draw(doc, max_drawn, state):
     )
     target = doc.modelspace()
     limit_views = False
-    if not any(skip_kind(entity) is None for entity in doc.modelspace()):
+    if layout_name:
+        target = named_layout(doc, layout_name)
+        promote_viewreps(doc)
+        if sheet_viewports(target):
+            limit_views = True
+    elif not any(skip_kind(entity) is None for entity in doc.modelspace()):
         sheet = sole_sheet(doc)
         if sheet is not None:
             promote_viewreps(doc)
@@ -741,7 +758,7 @@ def run(args, state):
     doc = read_document(args.src, state)
     from ezdxf.fonts.font_manager import FontNotFoundError
     try:
-        root, drawn_box, emitted = draw(doc, args.max_drawn_entities, state)
+        root, drawn_box, emitted = draw(doc, args.max_drawn_entities, state, args.layout)
     except Outcome:
         raise
     except DrawnOverCap:
@@ -765,6 +782,7 @@ def main():
     ap.add_argument("--texts", required=True)
     ap.add_argument("--render-svg", required=True)
     ap.add_argument("--measure", default="")
+    ap.add_argument("--layout", default="")
     ap.add_argument("src")
     ap.add_argument("svg")
     args = ap.parse_args()

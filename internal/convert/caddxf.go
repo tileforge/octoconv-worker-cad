@@ -79,14 +79,14 @@ func (c CADDXFConverter) ConvertWithStages(ctx context.Context, inPath, outPath 
 	}()
 
 	if target == "svg" {
-		_, err = c.dxfDrawing(ctx, jobDir, inPath, outPath, "", st)
+		_, err = c.dxfDrawing(ctx, jobDir, inPath, outPath, "", parsed.Layout, st)
 		return err
 	}
 	if target == "png" {
-		err = c.writeDrawingPNG(ctx, jobDir, inPath, outPath, st)
+		err = c.writeDrawingPNG(ctx, jobDir, inPath, outPath, parsed.Layout, st)
 		return err
 	}
-	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", "", st)
+	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", "", parsed.Layout, st)
 	if err != nil {
 		return err
 	}
@@ -107,10 +107,10 @@ func (c CADDXFConverter) ConvertWithStages(ctx context.Context, inPath, outPath 
 	return nil
 }
 
-func (c CADDXFConverter) writeDrawingPNG(ctx context.Context, jobDir, inPath, outPath string, st cadStager) error {
+func (c CADDXFConverter) writeDrawingPNG(ctx context.Context, jobDir, inPath, outPath, layout string, st cadStager) error {
 	o := CADOpts{}.Resolved()
 	size := *o.Size
-	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", "", st)
+	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", "", layout, st)
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (c CADDXFRenderConverter) ConvertWithStages(ctx context.Context, inPath, ou
 	}()
 
 	draftPath := filepath.Join(jobDir, cadMeasureDraftName)
-	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", draftPath, st)
+	d, err := c.dxfDrawing(ctx, jobDir, inPath, "", draftPath, parsed.Layout, st)
 	if err != nil {
 		return err
 	}
@@ -298,7 +298,7 @@ func cadDXFClear(path string) error {
 	return nil
 }
 
-func (c CADConverter) dxfDrawing(ctx context.Context, jobDir, inPath, clientOut, measure string, st cadStager) (cadDXFDrawing, error) {
+func (c CADConverter) dxfDrawing(ctx context.Context, jobDir, inPath, clientOut, measure, layout string, st cadStager) (cadDXFDrawing, error) {
 	var d cadDXFDrawing
 	st.enter(cadStageGuard)
 	if _, err := c.guardStage(ctx, jobDir, "dxf", inPath); err != nil {
@@ -318,7 +318,7 @@ func (c CADConverter) dxfDrawing(ctx context.Context, jobDir, inPath, clientOut,
 		}
 	}
 	st.enter(cadStageDXF)
-	v, err := c.dxfStage(ctx, jobDir, inPath, draw, render, texts, measure)
+	v, err := c.dxfStage(ctx, jobDir, inPath, draw, render, texts, measure, layout)
 	if err != nil {
 		return d, err
 	}
@@ -387,7 +387,7 @@ func (c CADConverter) dxfInk(ctx context.Context, jobDir, clean string, render C
 	return nil
 }
 
-func (c CADConverter) dxfStage(ctx context.Context, jobDir, inPath, svg, render, texts, measure string) (cadVerdict, error) {
+func (c CADConverter) dxfStage(ctx context.Context, jobDir, inPath, svg, render, texts, measure, layout string) (cadVerdict, error) {
 	x, err := c.cadDrawStage(jobDir, cadDXFReadOnly, cadDXFEngines)
 	if err != nil {
 		return cadVerdict{}, err
@@ -402,6 +402,9 @@ func (c CADConverter) dxfStage(ctx context.Context, jobDir, inPath, svg, render,
 	}
 	if measure != "" {
 		args = append(args, "--measure", measure)
+	}
+	if layout != "" {
+		args = append(args, "--layout="+layout)
 	}
 	args = append(args, inPath, svg)
 	out, cpu, err := x.runBounded(stageCtx, cadOutputLimit, "cad-dxf", args...)

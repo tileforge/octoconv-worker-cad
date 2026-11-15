@@ -187,6 +187,31 @@ def main():
             raise SystemExit("model text was clipped to a viewport")
         if path_count(model_root) < 2:
             raise SystemExit("model xline produced no path")
+
+        chosen = ezdxf.new("R2018", setup=True)
+        chosen.modelspace().add_line((0, 0), (10, 0))
+        chosen.layouts.new("Sheet").add_line((0, 0), (200, 0))
+        chosen.layouts.new("Other").add_line((0, 0), (30, 0))
+
+        def drawn_span(layout_name):
+            _, box, _ = cad.draw(chosen, 1000, cad.new_state(), layout_name)
+            return span(box)
+
+        if drawn_span("") >= 50:
+            raise SystemExit("omitted layout left model space: %s" % drawn_span(""))
+        if drawn_span("Sheet") <= 150:
+            raise SystemExit("named Sheet was not drawn")
+        other_span = drawn_span("Other")
+        if other_span < 20 or other_span > 80:
+            raise SystemExit("named Other span %s" % other_span)
+        for name in ("Missing", "Model"):
+            try:
+                cad.draw(chosen, 1000, cad.new_state(), name)
+            except cad.Outcome as out:
+                if out.verdict != "failed" or out.reason != "unknown_layout":
+                    raise SystemExit("%s outcome %s %s" % (name, out.verdict, out.reason))
+            else:
+                raise SystemExit("%s was drawn" % name)
     print("ok")
 
 
