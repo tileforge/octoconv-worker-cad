@@ -614,12 +614,13 @@ def draw(doc, max_drawn, state, layout_name=""):
     )
     target = doc.modelspace()
     limit_views = False
+    model_drawable = any(skip_kind(entity) is None for entity in doc.modelspace())
     if layout_name:
         target = named_layout(doc, layout_name)
         promote_viewreps(doc)
-        if sheet_viewports(target):
+        if sheet_viewports(target) and not model_drawable:
             limit_views = True
-    elif not any(skip_kind(entity) is None for entity in doc.modelspace()):
+    elif not model_drawable:
         sheet = sole_sheet(doc)
         if sheet is not None:
             promote_viewreps(doc)

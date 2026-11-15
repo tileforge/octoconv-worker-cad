@@ -212,10 +212,34 @@ def main():
                     raise SystemExit("%s outcome %s %s" % (name, out.verdict, out.reason))
             else:
                 raise SystemExit("%s was drawn" % name)
+
+        window = ezdxf.new("R2018", setup=True)
+        window.modelspace().add_circle((0, 0), radius=5)
+        paper = window.layouts.new("Window")
+        paper.add_line((0, 0), (10, 0))
+        paper.add_viewport(
+            center=(40, 40),
+            size=(30, 30),
+            view_center_point=(0, 0),
+            view_height=20,
+            status=2,
+        )
+        window_state = cad.new_state()
+        window_root, _, _ = cad.draw(window, 1000, window_state, "Window")
+        if path_count(window_root) < 2:
+            raise SystemExit("named layout hid the model circle: paths %s drawn %s" % (
+                path_count(window_root), window_state["entities_drawn"]))
+
+        named_part = draw_layout(sheet_doc(), tmp, "named-part", [("PART", (5.0, 6.0))], "Sheet")
+        if path_count(named_part[1]) != path_count(shown[1]):
+            raise SystemExit("named empty-model sheet paths %s, sole sheet %s" % (
+                path_count(named_part[1]), path_count(shown[1])))
+        if span(named_part[2]) > 1000:
+            raise SystemExit("named empty-model sheet uses model coordinates: %s" % (named_part[2],))
     print("ok")
 
 
-def draw_copy(doc, tmp, name, reps, freeze=""):
+def draw_layout(doc, tmp, name, reps, layout_name, freeze=""):
     path = str(Path(tmp) / (name + ".dxf"))
     save_with_viewrep(doc, path, reps)
     loaded = ezdxf.readfile(path)
@@ -225,8 +249,12 @@ def draw_copy(doc, tmp, name, reps, freeze=""):
             if entity.dxftype() == "VIEWPORT" and entity.dxf.status > 1:
                 entity.frozen_layers = [freeze]
     state = cad.new_state()
-    root, box, emitted = cad.draw(loaded, 1000, state)
+    root, box, emitted = cad.draw(loaded, 1000, state, layout_name)
     return state, root, box, emitted
+
+
+def draw_copy(doc, tmp, name, reps, freeze=""):
+    return draw_layout(doc, tmp, name, reps, "", freeze)
 
 
 def span(box):
