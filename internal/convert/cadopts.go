@@ -162,16 +162,16 @@ func ValidateCADApplicability(engine, operation, source, target string, o CADOpt
 	if engine != EngineCAD {
 		return fmt.Errorf("cad options are only valid for cad-engine conversions")
 	}
-	if NormalizeFormat(source) == "dxf" {
+	if format := NormalizeFormat(source); format == "dxf" || format == "dwg" {
 		switch {
 		case operation == OperationConvert:
-			return fmt.Errorf("no option applies to a dxf conversion")
+			return fmt.Errorf("no option applies to a %s conversion", format)
 		case operation == OperationRender && o.View != "":
-			return fmt.Errorf("view does not apply to a dxf source")
+			return fmt.Errorf("view does not apply to a %s source", format)
 		case operation == OperationRender && o.Quality != "":
-			return fmt.Errorf("quality does not apply to a dxf source")
+			return fmt.Errorf("quality does not apply to a %s source", format)
 		case operation == OperationRender && o.Dimensions != nil:
-			return fmt.Errorf("dimensions does not apply to a dxf source")
+			return fmt.Errorf("dimensions does not apply to a %s source", format)
 		}
 	}
 	switch operation {

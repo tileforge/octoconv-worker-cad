@@ -10,7 +10,9 @@
       "parameter_schema": {},
       "formats": [
         {"from": "dxf", "to": "svg"},
-        {"from": "dxf", "to": "pdf"}
+        {"from": "dxf", "to": "pdf"},
+        {"from": "dwg", "to": "svg"},
+        {"from": "dwg", "to": "pdf"}
       ]
     }
   ]

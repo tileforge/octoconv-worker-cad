@@ -14,11 +14,10 @@ const (
 	CADRejectTruncated    CADRejection = "truncated"
 	CADRejectAmbiguousSTL CADRejection = "ambiguous_stl"
 	CADRejectBinaryDXF    CADRejection = "binary_dxf"
-	CADRejectDWG          CADRejection = "dwg"
 )
 
 func AllCADRejections() []CADRejection {
-	return []CADRejection{CADRejectTruncated, CADRejectAmbiguousSTL, CADRejectBinaryDXF, CADRejectDWG}
+	return []CADRejection{CADRejectTruncated, CADRejectAmbiguousSTL, CADRejectBinaryDXF}
 }
 
 type CADResult struct {
@@ -114,7 +113,7 @@ func SniffCADWindows(head, tail []byte, size int64, declared string) CADResult {
 		return sniffSTL(head, tail, size)
 	}
 	if len(head) >= 6 && bytes.HasPrefix(head, dwgPrefix) && isASCIIDigits(head[4:6]) {
-		return CADResult{Format: "dwg", Rejection: CADRejectDWG}
+		return CADResult{Format: "dwg"}
 	}
 	if bytes.HasPrefix(head, binaryDXFTag) {
 		return CADResult{Format: "dxf", Rejection: CADRejectBinaryDXF}

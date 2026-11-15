@@ -15,6 +15,9 @@ var cadStageRoutes = map[cadRouteKey][]string{
 	{OperationConvert, "dxf", "svg"}:  {cadStageGuard, cadStageDXF, cadStageInk},
 	{OperationConvert, "dxf", "pdf"}:  {cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
 	{OperationRender, "dxf", "png"}:   {cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
+	{OperationConvert, "dwg", "svg"}:  {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk},
+	{OperationConvert, "dwg", "pdf"}:  {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
+	{OperationRender, "dwg", "png"}:   {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
 }
 
 func CADStages(op, from, to string) ([]string, bool) {

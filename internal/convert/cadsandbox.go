@@ -144,13 +144,13 @@ func (c CADConverter) WithSandbox(helper []string) CADConverter {
 	return c
 }
 
-func ValidateCADTimeouts(guard, mesh, render, dxf, rsvg, engine time.Duration) error {
+func ValidateCADTimeouts(guard, mesh, render, dxf, dwg, rsvg, engine time.Duration) error {
 	for _, v := range []struct {
 		name  string
 		value time.Duration
 	}{
 		{"CAD_GUARD_TIMEOUT", guard}, {"CAD_MESH_TIMEOUT", mesh}, {"CAD_RENDER_TIMEOUT", render},
-		{"CAD_DXF_TIMEOUT", dxf}, {"CAD_RSVG_TIMEOUT", rsvg}, {"CAD_ENGINE_TIMEOUT", engine},
+		{"CAD_DXF_TIMEOUT", dxf}, {"CAD_DWG_TIMEOUT", dwg}, {"CAD_RSVG_TIMEOUT", rsvg}, {"CAD_ENGINE_TIMEOUT", engine},
 	} {
 		if v.value <= 0 {
 			return fmt.Errorf("%s=%s must be positive", v.name, v.value)
@@ -160,22 +160,22 @@ func ValidateCADTimeouts(guard, mesh, render, dxf, rsvg, engine time.Duration) e
 		return fmt.Errorf("CAD_GUARD_TIMEOUT=%s + CAD_MESH_TIMEOUT=%s + CAD_RENDER_TIMEOUT=%s + %s of I/O allowance exceeds CAD_ENGINE_TIMEOUT=%s: "+
 			"the attempt deadline would cut a stage short of its own limit", guard, mesh, render, CADIOAllowance, engine)
 	}
-	if guard+dxf+2*rsvg+CADIOAllowance > engine {
-		return fmt.Errorf("CAD_GUARD_TIMEOUT=%s + CAD_DXF_TIMEOUT=%s + two rsvg-convert stages of CAD_RSVG_TIMEOUT=%s + %s of I/O allowance exceeds CAD_ENGINE_TIMEOUT=%s: "+
-			"the attempt deadline would cut a stage short of its own limit", guard, dxf, rsvg, CADIOAllowance, engine)
+	if guard+dwg+dxf+2*rsvg+CADIOAllowance > engine {
+		return fmt.Errorf("CAD_GUARD_TIMEOUT=%s + CAD_DWG_TIMEOUT=%s + CAD_DXF_TIMEOUT=%s + two rsvg-convert stages of CAD_RSVG_TIMEOUT=%s + %s of I/O allowance exceeds CAD_ENGINE_TIMEOUT=%s: "+
+			"the attempt deadline would cut a stage short of its own limit", guard, dwg, dxf, rsvg, CADIOAllowance, engine)
 	}
 	return nil
 }
 
-func ConfinedCAD(helper []string, concurrency int, concurrencyEnv string, guard, mesh, render, dxf, rsvg, engine time.Duration) (CADConverter, error) {
+func ConfinedCAD(helper []string, concurrency int, concurrencyEnv string, guard, mesh, render, dxf, dwg, rsvg, engine time.Duration) (CADConverter, error) {
 	if concurrency != 1 {
 		return CADConverter{}, fmt.Errorf("%s=%d: the cad pod limit was derived for one job at a time; set %s=1 and scale with replicas",
 			concurrencyEnv, concurrency, concurrencyEnv)
 	}
-	if err := ValidateCADTimeouts(guard, mesh, render, dxf, rsvg, engine); err != nil {
+	if err := ValidateCADTimeouts(guard, mesh, render, dxf, dwg, rsvg, engine); err != nil {
 		return CADConverter{}, err
 	}
-	c := CADConverter{GuardTimeout: guard, MeshTimeout: mesh, RenderTimeout: render, DXFTimeout: dxf, RsvgTimeout: rsvg}.WithSandbox(helper)
+	c := CADConverter{GuardTimeout: guard, MeshTimeout: mesh, RenderTimeout: render, DXFTimeout: dxf, DWGTimeout: dwg, RsvgTimeout: rsvg}.WithSandbox(helper)
 	return c, nil
 }
 

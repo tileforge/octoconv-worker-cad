@@ -138,12 +138,15 @@ func TestManifestPairsStayDisjoint(t *testing.T) {
 			},
 		},
 		"manifest-caddraw-convert.json": {
-			id:    "octoconv.convert.caddraw",
-			pairs: []pair{{From: "dxf", To: "svg"}, {From: "dxf", To: "pdf"}},
+			id: "octoconv.convert.caddraw",
+			pairs: []pair{
+				{From: "dxf", To: "svg"}, {From: "dxf", To: "pdf"},
+				{From: "dwg", To: "svg"}, {From: "dwg", To: "pdf"},
+			},
 		},
 		"manifest-caddraw-render.json": {
 			id:    "octoconv.render.caddraw",
-			pairs: []pair{{From: "dxf", To: "png"}},
+			pairs: []pair{{From: "dxf", To: "png"}, {From: "dwg", To: "png"}},
 		},
 	}
 	seen := map[pair]string{}
@@ -180,7 +183,7 @@ func TestManifestPairsStayDisjoint(t *testing.T) {
 			}
 		}
 	}
-	if len(seen) != 8 {
+	if len(seen) != 11 {
 		t.Fatalf("pairs = %d", len(seen))
 	}
 }
@@ -191,6 +194,9 @@ func TestCadEngineCode(t *testing.T) {
 	}
 	if cadEngineCode(convert.ErrCADUnreadable) != "cad_unreadable" {
 		t.Fatal("unreadable")
+	}
+	if cadEngineCode(convert.ErrCADDWGTimeout) != "cad_too_complex" {
+		t.Fatal("dwg timeout")
 	}
 	if cadEngineCode(convert.ErrEngineSandboxUnavailable) != "timeout" {
 		t.Fatal("sandbox")
