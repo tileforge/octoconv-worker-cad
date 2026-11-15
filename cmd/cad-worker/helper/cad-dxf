@@ -191,6 +191,135 @@ def measure_draft(state, bbox):
     }
 
 
+def tag_value(entity, code):
+    # Group codes of AcDbBlockReference. ezdxf keeps ACDBVIEWREPBLOCKREFERENCE
+    # as tag storage, so the block name and the insert point are not attributes.
+    tags = getattr(entity, "xtags", None)
+    if tags is None:
+        return None
+    for tag in tags:
+        if tag.code == code:
+            return tag.value
+    return None
+
+
+def promote_viewreps(doc):
+    for entity in list(doc.modelspace()):
+        if entity.dxftype() != "ACDBVIEWREPBLOCKREFERENCE":
+            continue
+        name = tag_value(entity, 2)
+        raw = tag_value(entity, 10)
+        if not isinstance(name, str) or name == "":
+            continue
+        if not isinstance(raw, tuple) or len(raw) < 2:
+            continue
+        layout_ = doc.blocks.get(name)
+        block = None if layout_ is None else layout_.block
+        if block is None or block.is_xref or block.is_xref_overlay:
+            continue
+        attribs = {}
+        layer = tag_value(entity, 8)
+        if isinstance(layer, str) and layer != "":
+            attribs["layer"] = layer
+        for code, attr in ((41, "xscale"), (42, "yscale"), (43, "zscale"), (50, "rotation")):
+            value = tag_value(entity, code)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            attribs[attr] = float(value)
+        visibility = tag_value(entity, 60)
+        if isinstance(visibility, int) and not isinstance(visibility, bool) and visibility != 0:
+            attribs["invisible"] = 1
+        doc.modelspace().add_blockref(name, raw, dxfattribs=attribs)
+
+
+VIEW_POINT_TOL = 1e-4
+
+
+def point2(raw):
+    if raw is None or isinstance(raw, (str, bytes)):
+        return None
+    try:
+        x = raw[0]
+        y = raw[1]
+    except (TypeError, IndexError, KeyError):
+        return None
+    if isinstance(x, bool) or isinstance(y, bool):
+        return None
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        return None
+    return (float(x), float(y))
+
+
+def viewport_model_center(vp):
+    # ezdxf Viewport.get_modelspace_limits uses view_center_point + view_target_point.
+    center = point2(vp.dxf.get("view_center_point", None))
+    if center is None:
+        return None
+    target = point2(vp.dxf.get("view_target_point", None))
+    if target is None:
+        target = (0.0, 0.0)
+    return (center[0] + target[0], center[1] + target[1])
+
+
+def entity_view_point(entity):
+    if entity.dxftype() == "ACDBVIEWREPBLOCKREFERENCE":
+        return point2(tag_value(entity, 10))
+    if entity.dxftype() == "INSERT":
+        return point2(entity.dxf.get("insert", None))
+    return None
+
+
+def same_view_point(a, b):
+    return abs(a[0] - b[0]) <= VIEW_POINT_TOL and abs(a[1] - b[1]) <= VIEW_POINT_TOL
+
+
+def entities_at_view(vp, entities):
+    center = viewport_model_center(vp)
+    if center is None:
+        return
+    for entity in entities:
+        point = entity_view_point(entity)
+        if point is not None and same_view_point(point, center):
+            yield entity
+
+
+def sheet_viewports(layout):
+    def status(entity):
+        value = entity.dxf.get("status", 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return value
+
+    viewports = [entity for entity in layout if entity.dxftype() == "VIEWPORT"]
+    viewports.sort(key=status)
+    viewports = [entity for entity in viewports if status(entity) > 0]
+    if viewports and status(viewports[0]) == 1:
+        viewports.pop(0)
+    usable = []
+    for entity in viewports:
+        if not getattr(entity, "is_top_view", False):
+            continue
+        try:
+            entity.get_modelspace_limits()
+        except (AttributeError, ValueError, ZeroDivisionError):
+            continue
+        usable.append(entity)
+    return usable
+
+
+def sole_sheet(doc):
+    sheets = []
+    for name in doc.layouts.names():
+        if name == "Model":
+            continue
+        layout_ = doc.layouts.get(name)
+        if layout_ is not None and sheet_viewports(layout_):
+            sheets.append(layout_)
+    if len(sheets) != 1:
+        return None
+    return sheets[0]
+
+
 def padded_frame(frame, BoundingBox2d):
     w = frame.size.x
     h = frame.size.y
@@ -205,12 +334,22 @@ def padded_frame(frame, BoundingBox2d):
 
 def draw(doc, max_drawn, state):
     from ezdxf.addons.drawing import Frontend, RenderContext, config, layout, svg
-    from ezdxf.addons.drawing.frontend import UniversalFrontend
+    from ezdxf.addons.drawing.frontend import UniversalFrontend, _draw_entities
     from ezdxf.addons.drawing.pipeline import RenderPipeline2d, prepare_string_for_rendering
     from ezdxf.entities.acad_table import AcadTableBlockContent
     from ezdxf.entities.dxfentity import DXFTagStorage
     from ezdxf.math import BoundingBox2d, Matrix44, Vec2
     from ezdxf.math.clipping import ClippingRect2d
+    from ezdxf.npshapes import NumpyPoints2d
+
+    def portal_matrix(portal):
+        # ezdxf 1.4.5 keeps each model-to-paper transform on a private clipping stage.
+        placed = Matrix44()
+        for stage in reversed(portal._stages):
+            transform = stage.transform
+            if transform is not None:
+                placed = transform @ placed
+        return placed
 
     texts = []
     infinite = []
@@ -233,11 +372,17 @@ def draw(doc, max_drawn, state):
             return "PROXY:" + kind
         return None
 
+    seen_skips = set()
+
     def keep(entity):
         kind = skip_kind(entity)
         if kind is None:
             return True
-        skipped[kind] = skipped.get(kind, 0) + 1
+        handle = entity.dxf.get("handle", None)
+        key = (kind, handle if isinstance(handle, str) else id(entity))
+        if key not in seen_skips:
+            seen_skips.add(key)
+            skipped[kind] = skipped.get(kind, 0) + 1
         return False
 
     class TextPipeline(RenderPipeline2d):
@@ -265,6 +410,24 @@ def draw(doc, max_drawn, state):
                 p.transform_inplace(transform)
                 if len(p):
                     box.extend(p.extents())
+            placed = Matrix44(transform)
+            clip = None
+            portal = self.clipping_portal
+            if portal.is_active:
+                placed = portal_matrix(portal) @ placed
+                if box.has_data:
+                    kept = []
+                    paper = BoundingBox2d()
+                    for poly in portal.clip_polygon(NumpyPoints2d(box.rect_vertices())):
+                        pts = [(float(v.x), float(v.y)) for v in poly.vertices()]
+                        if len(pts) < 3:
+                            continue
+                        kept.append(pts)
+                        paper.extend(pts)
+                    if not kept:
+                        return
+                    box = paper
+                    clip = kept
             fonts = faces.get(id(gc.font))
             if fonts is None:
                 fonts = faces[id(gc.font)] = font_attrs(gc.font)
@@ -282,6 +445,7 @@ def draw(doc, max_drawn, state):
                 "font": fonts[1],
                 "color": self.get_backend_properties(properties).color,
                 "box": box,
+                "clip": clip,
             })
             if TEXT_AS_OUTLINE:
                 RenderPipeline2d.draw_text(self, text, transform, properties, cap_height, dxftype)
@@ -344,9 +508,49 @@ def draw(doc, max_drawn, state):
     class DXFFrontend(Frontend):
         def __init__(self, ctx, pipeline, cfg):
             UniversalFrontend.__init__(self, ctx, pipeline, cfg)
+            self.viewport = None
+            self.limit_views = False
 
         def draw_entities(self, entities, *, filter_func=None):
             super().draw_entities(entities, filter_func=keep)
+
+        def draw_viewport(self, vp):
+            self.viewport = vp
+            try:
+                super().draw_viewport(vp)
+            finally:
+                self.viewport = None
+
+        def draw_entities_callback(self, ctx, entities):
+            if self.limit_views and self.viewport is not None:
+                entities = entities_at_view(self.viewport, entities)
+            previous = self.ctx
+            self.ctx = ctx
+            try:
+                _draw_entities(self, ctx, entities, filter_func=keep)
+            finally:
+                self.ctx = previous
+
+        def draw_clipped_infinite(self, entity, properties):
+            start = Vec2(entity.dxf.start)
+            direction = Vec2(entity.dxf.unit_vector)
+            if direction.is_null:
+                return
+            d = direction.normalize()
+            reach = 1.0
+            if self.viewport is not None:
+                try:
+                    limits = self.viewport.get_modelspace_limits()
+                except (AttributeError, ValueError, ZeroDivisionError):
+                    limits = None
+                if limits is not None:
+                    for x, y in ((limits[0], limits[1]), (limits[0], limits[3]), (limits[2], limits[1]), (limits[2], limits[3])):
+                        reach = max(reach, math.hypot(x - start.x, y - start.y))
+            else:
+                reach = 1.0e6
+            kind = entity.dxftype()
+            a = start - d * (reach + 1.0) if kind == "XLINE" else start
+            self.pipeline.draw_line(a, start + d * (reach + 1.0), properties)
 
         def draw_entity(self, entity, properties):
             state["entities_drawn"] += 1
@@ -378,6 +582,9 @@ def draw(doc, max_drawn, state):
         def draw_line_entity(self, entity, properties):
             kind = entity.dxftype()
             if kind in INFINITE_LINES:
+                if self.pipeline.clipping_portal.is_active:
+                    self.draw_clipped_infinite(entity, properties)
+                    return
                 infinite.append((kind, Vec2(entity.dxf.start), Vec2(entity.dxf.unit_vector), properties))
                 return
             super().draw_line_entity(entity, properties)
@@ -393,8 +600,17 @@ def draw(doc, max_drawn, state):
         color_policy=config.ColorPolicy.COLOR,
         hatching_timeout=HATCH_TIMEOUT_S,
     )
+    target = doc.modelspace()
+    limit_views = False
+    if not any(skip_kind(entity) is None for entity in doc.modelspace()):
+        sheet = sole_sheet(doc)
+        if sheet is not None:
+            promote_viewreps(doc)
+            target = sheet
+            limit_views = True
     fe = DXFFrontend(RenderContext(doc), pipeline, cfg)
-    fe.draw_layout(doc.modelspace(), finalize=False, filter_func=keep)
+    fe.limit_views = limit_views
+    fe.draw_layout(target, finalize=False, filter_func=keep)
 
     frame = BoundingBox2d()
     if backend.frame.has_data:
@@ -451,7 +667,27 @@ def draw(doc, max_drawn, state):
         size = t["em"] * k
         if k <= 0.0 or size <= 0.0:
             continue
-        el = ET.SubElement(group, "text")
+        parent = group
+        polygons = t["clip"]
+        if polygons:
+            defs = root.find("defs")
+            if defs is None:
+                defs = ET.Element("defs")
+                root.insert(0, defs)
+            clip = ET.SubElement(defs, "clipPath")
+            clip_id = "tclip%d" % len(defs)
+            clip.set("id", clip_id)
+            for poly in polygons:
+                points = []
+                for x, y in poly:
+                    v = T.transform((x, y, 0))
+                    points.append("%.6g,%.6g" % (v.x, v.y))
+                if len(points) >= 3:
+                    el = ET.SubElement(clip, "polygon")
+                    el.set("points", " ".join(points))
+            parent = ET.SubElement(group, "g")
+            parent.set("clip-path", "url(#%s)" % clip_id)
+        el = ET.SubElement(parent, "text")
         el.set("transform", "matrix(%s)" % " ".join("%.6g" % v for v in (
             m[0, 0] / k, m[0, 1] / k, m[1, 0] / k, m[1, 1] / k, m[3, 0], m[3, 1])))
         el.set("font-family", t["family"])
