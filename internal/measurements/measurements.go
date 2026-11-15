@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"strings"
 )
 
 const (
@@ -37,6 +38,8 @@ const (
 	FormatIGES               = "iges"
 	FormatSTL                = "stl"
 	FormatDXF                = "dxf"
+	MaxSkippedKinds          = 64
+	MaxSkipKindLen           = 128
 )
 
 var ErrInvalid = errors.New("invalid measurements document")
@@ -74,19 +77,25 @@ type BBox struct {
 	Max []float64 `json:"max"`
 }
 
+type Body struct {
+	BBox BBox `json:"bbox"`
+}
+
 type Document struct {
-	Schema           string   `json:"schema"`
-	Format           string   `json:"format"`
-	Unit             string   `json:"unit"`
-	UnitSource       string   `json:"unit_source"`
-	BBox             BBox     `json:"bbox"`
-	Solids           *int     `json:"solids,omitempty"`
-	ClosedSolids     *int     `json:"closed_solids,omitempty"`
-	Volume           *float64 `json:"volume"`
-	VolumeNullReason string   `json:"volume_null_reason,omitempty"`
-	Area             *float64 `json:"area"`
-	AreaNullReason   string   `json:"area_null_reason,omitempty"`
-	MeshFindings     []string `json:"mesh_findings,omitempty"`
+	Schema           string         `json:"schema"`
+	Format           string         `json:"format"`
+	Unit             string         `json:"unit"`
+	UnitSource       string         `json:"unit_source"`
+	BBox             BBox           `json:"bbox"`
+	Solids           *int           `json:"solids,omitempty"`
+	ClosedSolids     *int           `json:"closed_solids,omitempty"`
+	Volume           *float64       `json:"volume"`
+	VolumeNullReason string         `json:"volume_null_reason,omitempty"`
+	Area             *float64       `json:"area"`
+	AreaNullReason   string         `json:"area_null_reason,omitempty"`
+	MeshFindings     []string       `json:"mesh_findings,omitempty"`
+	Bodies           []Body         `json:"bodies,omitempty"`
+	Skipped          map[string]int `json:"skipped,omitempty"`
 }
 
 func invalid(field, format string, args ...any) error {
@@ -122,8 +131,10 @@ func Validate(raw []byte) (Document, error) {
 			return Document{}, invalid(k, "empty reason")
 		}
 	}
-	if v, ok := keys["mesh_findings"]; ok && string(v) == "null" {
-		return Document{}, invalid("mesh_findings", "null")
+	for _, k := range []string{"mesh_findings", "bodies", "skipped"} {
+		if v, ok := keys[k]; ok && string(v) == "null" {
+			return Document{}, invalid(k, "null")
+		}
 	}
 	for _, k := range []string{"solids", "closed_solids"} {
 		_, present := keys[k]
@@ -169,7 +180,7 @@ func (d Document) Validate() error {
 	if d.Format == FormatDXF {
 		dims = 2
 	}
-	if err := d.validateBBox(dims); err != nil {
+	if err := d.validateBox("bbox", d.BBox, dims); err != nil {
 		return err
 	}
 
@@ -217,6 +228,12 @@ func (d Document) Validate() error {
 		return invalid("area_null_reason", "%q differs from volume_null_reason %q: both describe the same shape", d.AreaNullReason, d.VolumeNullReason)
 	}
 	if err := d.validateMeshFindings(); err != nil {
+		return err
+	}
+	if err := d.validateBodies(); err != nil {
+		return err
+	}
+	if err := d.validateSkipped(); err != nil {
 		return err
 	}
 	return nil
@@ -268,29 +285,101 @@ func (d Document) bboxAxes() int {
 	return n
 }
 
-func (d Document) validateBBox(dims int) error {
-	if len(d.BBox.Min) != dims || len(d.BBox.Max) != dims {
-		return invalid("bbox", "format %s needs %d coordinates per corner, got min %d and max %d", d.Format, dims, len(d.BBox.Min), len(d.BBox.Max))
+func (d Document) validateBox(field string, box BBox, dims int) error {
+	if len(box.Min) != dims || len(box.Max) != dims {
+		return invalid(field, "format %s needs %d coordinates per corner, got min %d and max %d", d.Format, dims, len(box.Min), len(box.Max))
 	}
 	for _, corner := range []struct {
 		name string
 		v    []float64
-	}{{"min", d.BBox.Min}, {"max", d.BBox.Max}} {
+	}{{"min", box.Min}, {"max", box.Max}} {
 		for i, c := range corner.v {
 			if math.IsNaN(c) || math.IsInf(c, 0) {
-				return invalid("bbox", "%s[%d] is not finite", corner.name, i)
+				return invalid(field, "%s[%d] is not finite", corner.name, i)
 			}
 			if math.Abs(c) > MaxAbsCoordinate {
-				return invalid("bbox", "%s[%d] = %g exceeds %g", corner.name, i, c, MaxAbsCoordinate)
+				return invalid(field, "%s[%d] = %g exceeds %g", corner.name, i, c, MaxAbsCoordinate)
 			}
 		}
 	}
-	for i := range d.BBox.Min {
-		if d.BBox.Min[i] > d.BBox.Max[i] {
-			return invalid("bbox", "min[%d] = %g is greater than max[%d] = %g", i, d.BBox.Min[i], i, d.BBox.Max[i])
+	for i := range box.Min {
+		if box.Min[i] > box.Max[i] {
+			return invalid(field, "min[%d] = %g is greater than max[%d] = %g", i, box.Min[i], i, box.Max[i])
 		}
 	}
 	return nil
+}
+
+func (d Document) validateBodies() error {
+	if len(d.Bodies) == 0 {
+		if d.Bodies != nil {
+			return invalid("bodies", "empty")
+		}
+		return nil
+	}
+	if d.Format != FormatSTEP && d.Format != FormatIGES {
+		return invalid("bodies", "not allowed for format %s", d.Format)
+	}
+	if len(d.Bodies) != *d.Solids {
+		return invalid("bodies", "length %d is not solids %d", len(d.Bodies), *d.Solids)
+	}
+	for i, body := range d.Bodies {
+		if err := d.validateBox(fmt.Sprintf("bodies[%d].bbox", i), body.BBox, 3); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d Document) validateSkipped() error {
+	if len(d.Skipped) == 0 {
+		if d.Skipped != nil {
+			return invalid("skipped", "empty")
+		}
+		return nil
+	}
+	if d.Format != FormatDXF {
+		return invalid("skipped", "not allowed for format %s", d.Format)
+	}
+	if len(d.Skipped) > MaxSkippedKinds {
+		return invalid("skipped", "%d kinds exceeds %d", len(d.Skipped), MaxSkippedKinds)
+	}
+	names := make([]string, 0, len(d.Skipped))
+	for name := range d.Skipped {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if !skipKindOK(name) {
+			return invalid("skipped", "kind %q is not a drawing skip kind", name)
+		}
+		if d.Skipped[name] < 1 {
+			return invalid("skipped", "kind %q has count %d", name, d.Skipped[name])
+		}
+	}
+	return nil
+}
+
+func skipKindOK(kind string) bool {
+	if kind == "" || len([]rune(kind)) > MaxSkipKindLen {
+		return false
+	}
+	rest, proxy := strings.CutPrefix(kind, "PROXY:")
+	if proxy {
+		if rest == "" || strings.Contains(rest, ":") {
+			return false
+		}
+	} else if strings.Contains(kind, ":") {
+		return false
+	}
+	for _, r := range rest {
+		digit := r >= '0' && r <= '9'
+		letter := r >= 'A' && r <= 'Z'
+		if !letter && !digit && r != '_' {
+			return false
+		}
+	}
+	return rest != ""
 }
 
 func (d Document) validateQuantity(name string, v *float64, reason string, cad bool, solids, closed int) error {

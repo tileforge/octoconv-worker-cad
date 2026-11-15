@@ -268,10 +268,13 @@ def solid_summary(shape):
     solids = closed = open_solids = 0
     volume = area = 0.0
     negative = False
+    boxes = []
     explorer = TopExp_Explorer(shape, TopAbs_SOLID)
     while explorer.More():
         solid = explorer.Current()
         solids += 1
+        lo, hi = document_box(solid)
+        boxes.append({"bbox": {"min": lo, "max": hi}})
         shells_closed = True
         shells = TopExp_Explorer(solid, TopAbs_SHELL)
         while shells.More():
@@ -306,7 +309,7 @@ def solid_summary(shape):
         reason = "negative_volume"
     else:
         vol_out, area_out = volume, area
-    return solids, closed, vol_out, area_out, reason
+    return solids, closed, vol_out, area_out, reason, boxes
 
 
 def document_box(shape):
@@ -339,12 +342,12 @@ def write_draft(path, draft):
 
 
 def measure_draft(fmt, src, shape, triangles):
-    solids, closed, volume, area, reason = solid_summary(shape)
+    solids, closed, volume, area, reason, boxes = solid_summary(shape)
     lo, hi = document_box(shape)
     unit, raw = iges_declared(src) if fmt == "iges" else step_declared(src)
     if unit == "" and raw != "":
         sys.stderr.write("cad-mesh: unit text not in vocabulary: %s\n" % raw)
-    return {
+    draft = {
         "format": fmt,
         "declared_unit": unit,
         "declared_unit_raw": raw,
@@ -357,6 +360,9 @@ def measure_draft(fmt, src, shape, triangles):
         "null_reason": reason,
         "triangles": triangles,
     }
+    if boxes:
+        draft["bodies"] = boxes
+    return draft
 
 
 def run(fmt, src, out, fd, quality, measure):
