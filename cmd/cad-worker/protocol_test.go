@@ -209,6 +209,9 @@ func TestCadEngineCode(t *testing.T) {
 	if cadEngineCode(convert.ErrEngineSandboxUnavailable) != "timeout" {
 		t.Fatal("sandbox")
 	}
+	if cadEngineCode(convert.ErrCADUnknownLayout) != "engine_error" {
+		t.Fatal("unknown layout")
+	}
 }
 
 func TestWorkerSourcesDoNotImportStores(t *testing.T) {

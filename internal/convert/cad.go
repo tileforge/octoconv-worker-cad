@@ -78,6 +78,7 @@ var (
 	ErrCADDWGTimeout      = errors.New("cad: the dwg took too long to read; simplify the drawing or export fewer details")
 	ErrCADRsvgTimeout     = errors.New("cad: the rsvg stage did not finish within the time limit")
 	ErrCADDrawingFailed   = errors.New("cad: the drawing stage failed")
+	ErrCADUnknownLayout   = errors.New("unknown layout")
 	ErrCADNothingDrawable = errors.New("cad: the drawing has nothing drawable")
 )
 
@@ -338,6 +339,9 @@ func classifyCADStage(stage string, parent, stageCtx context.Context, timeout ti
 		case "failed":
 			if render {
 				return v, fmt.Errorf("cad %s: %w: %s", stage, ErrCADRenderFailed, v.Reason)
+			}
+			if dxf && v.Reason == "unknown_layout" {
+				return v, fmt.Errorf("cad %s: %w", stage, ErrCADUnknownLayout)
 			}
 			if dxf {
 				return v, fmt.Errorf("cad %s: %w: %s", stage, ErrCADDrawingFailed, v.Reason)

@@ -1,11 +1,14 @@
 package convert
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDrawingPairsAdmitDWG(t *testing.T) {
@@ -74,12 +77,36 @@ func TestDWGApplicabilityMatchesDXF(t *testing.T) {
 	view := CADOpts{View: CADViewIso}
 	for _, format := range []string{"dxf", "dwg"} {
 		err := ValidateCADApplicability(EngineCAD, OperationConvert, format, "svg", view)
-		if err == nil || !strings.Contains(err.Error(), "no option applies to a "+format+" conversion") {
+		if err == nil || !strings.Contains(err.Error(), "only layout applies to a "+format+" conversion") {
 			t.Fatalf("%s convert: %v", format, err)
 		}
 		err = ValidateCADApplicability(EngineCAD, OperationRender, format, "png", view)
 		if err == nil || !strings.Contains(err.Error(), "view does not apply to a "+format+" source") {
 			t.Fatalf("%s render: %v", format, err)
 		}
+		if err := ValidateCADApplicability(EngineCAD, OperationConvert, format, "svg", CADOpts{Layout: "Sheet"}); err != nil {
+			t.Fatalf("%s layout convert: %v", format, err)
+		}
+		size := 512
+		if err := ValidateCADApplicability(EngineCAD, OperationRender, format, "png", CADOpts{Layout: "Sheet", Size: &size}); err != nil {
+			t.Fatalf("%s layout render: %v", format, err)
+		}
+	}
+	if err := ValidateCADApplicability(EngineCAD, OperationRender, "step", "png", CADOpts{Layout: "Sheet"}); err == nil || !strings.Contains(err.Error(), "layout does not apply to a step source") {
+		t.Fatalf("step layout: %v", err)
+	}
+}
+
+func TestUnknownLayoutStaysOffTheDrawingTimeout(t *testing.T) {
+	parent := context.Background()
+	unknown := []byte("CADVERDICT {\"stage\":\"dxf\",\"verdict\":\"failed\",\"reason\":\"unknown_layout\"}\n")
+	_, err := classifyCADStage(cadStageDXF, parent, parent, time.Second, unknown, engineCPU{}, errors.New("exit status 1"))
+	if !errors.Is(err, ErrCADUnknownLayout) || errors.Is(err, ErrCADDrawingFailed) {
+		t.Fatalf("unknown layout: %v", err)
+	}
+	failed := []byte("CADVERDICT {\"stage\":\"dxf\",\"verdict\":\"failed\",\"reason\":\"draw_exception\"}\n")
+	_, err = classifyCADStage(cadStageDXF, parent, parent, time.Second, failed, engineCPU{}, errors.New("exit status 1"))
+	if !errors.Is(err, ErrCADDrawingFailed) {
+		t.Fatalf("draw failure: %v", err)
 	}
 }
