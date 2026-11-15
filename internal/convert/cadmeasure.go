@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	cadMeasureDraftMaxBytes = 64 << 10
+	cadMeasureDraftMaxBytes = 1 << 20
 	cadFactorTolerance      = 1e-9
 )
 
@@ -45,6 +45,12 @@ type cadMeasureDraft struct {
 	NullReason      string            `json:"null_reason"`
 	Triangles       int               `json:"triangles"`
 	MeshFindings    []string          `json:"mesh_findings,omitempty"`
+	Bodies          []cadMeasureBody  `json:"bodies,omitempty"`
+	Skipped         map[string]int    `json:"skipped,omitempty"`
+}
+
+type cadMeasureBody struct {
+	BBox measurements.BBox `json:"bbox"`
 }
 
 func cadDraftError(format string, args ...any) error {
@@ -105,6 +111,18 @@ func (d cadMeasureDraft) checkFinite() error {
 	for _, c := range d.BBox.Max {
 		if err := check("bbox.max", c); err != nil {
 			return err
+		}
+	}
+	for i, body := range d.Bodies {
+		for _, c := range body.BBox.Min {
+			if err := check(fmt.Sprintf("bodies[%d].bbox.min", i), c); err != nil {
+				return err
+			}
+		}
+		for _, c := range body.BBox.Max {
+			if err := check(fmt.Sprintf("bodies[%d].bbox.max", i), c); err != nil {
+				return err
+			}
 		}
 	}
 	for name, p := range map[string]*float64{"applied_factor": d.AppliedFactor, "volume": d.Volume, "area": d.Area} {
@@ -252,6 +270,26 @@ func buildCADMeasurements(d cadMeasureDraft, assumeUnit string) (measurements.Do
 			return measurements.Document{}, cadDraftError("mesh_findings are only for stl")
 		}
 		doc.MeshFindings = append([]string(nil), d.MeshFindings...)
+	}
+	if len(d.Skipped) > 0 {
+		if d.Format != measurements.FormatDXF {
+			return measurements.Document{}, cadDraftError("skipped is only for dxf")
+		}
+		doc.Skipped = make(map[string]int, len(d.Skipped))
+		for name, n := range d.Skipped {
+			doc.Skipped[name] = n
+		}
+	}
+	if len(d.Bodies) > 0 {
+		if d.Format != measurements.FormatSTEP && d.Format != measurements.FormatIGES {
+			return measurements.Document{}, cadDraftError("bodies are only for step and iges")
+		}
+		doc.Bodies = make([]measurements.Body, len(d.Bodies))
+		for i, body := range d.Bodies {
+			doc.Bodies[i] = measurements.Body{
+				BBox: measurements.BBox{Min: lengths(body.BBox.Min), Max: lengths(body.BBox.Max)},
+			}
+		}
 	}
 	if err := doc.Validate(); err != nil {
 		return measurements.Document{}, fmt.Errorf("%w: %w", ErrCADMeasure, err)

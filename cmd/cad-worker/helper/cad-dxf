@@ -176,7 +176,7 @@ def declared_unit(code):
 def measure_draft(state, bbox):
     unit, raw = declared_unit(state["insunits"])
     lo, hi = bbox
-    return {
+    draft = {
         "format": "dxf",
         "declared_unit": unit,
         "declared_unit_raw": raw,
@@ -189,6 +189,9 @@ def measure_draft(state, bbox):
         "null_reason": "not_applicable_2d",
         "triangles": 0,
     }
+    if state["skipped"]:
+        draft["skipped"] = state["skipped"]
+    return draft
 
 
 def tag_value(entity, code):
