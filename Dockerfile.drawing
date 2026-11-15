@@ -27,10 +27,9 @@ COPY --from=venv /opt/venv /opt/venv
 # Landlock grants the real interpreter inode. The venv's python3 link otherwise
 # points at /usr/local/bin/python3, a symlink that inode rule does not cover.
 RUN ln -sfn /usr/local/bin/python3.12 /opt/venv/bin/python3
-COPY cmd/cad-worker/helper/cad-guard /usr/local/bin/cad-guard
-COPY cmd/cad-worker/helper/cad-dxf /usr/local/bin/cad-dxf
-COPY --from=dwg /src/cmd/cad-dwg/target/release/cad-dwg /usr/local/bin/cad-dwg
-RUN chmod 0755 /usr/local/bin/cad-guard /usr/local/bin/cad-dxf /usr/local/bin/cad-dwg
+COPY --chmod=0755 cmd/cad-worker/helper/cad-guard /usr/local/bin/cad-guard
+COPY --chmod=0755 cmd/cad-worker/helper/cad-dxf /usr/local/bin/cad-dxf
+COPY --from=dwg --chmod=0755 /src/cmd/cad-dwg/target/release/cad-dwg /usr/local/bin/cad-dwg
 RUN d=$(mktemp -d) \
  && HOME="$d" XDG_CACHE_HOME="$d/.cache" XDG_CONFIG_HOME="$d/.config" \
     /opt/venv/bin/python -I -B -c "import ezdxf, ezdxf.addons.drawing.frontend, ezdxf.addons.drawing.svg" \
