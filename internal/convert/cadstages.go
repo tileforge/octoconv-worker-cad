@@ -17,6 +17,7 @@ var cadStageRoutes = map[cadRouteKey][]string{
 	{OperationRender, "dxf", "png"}:   {cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
 	{OperationConvert, "dwg", "svg"}:  {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk},
 	{OperationConvert, "dwg", "pdf"}:  {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
+	{OperationConvert, "dwg", "png"}:  {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
 	{OperationRender, "dwg", "png"}:   {cadStageDWG, cadStageGuard, cadStageDXF, cadStageInk, cadStageRsvg, cadStageJudge},
 }
 

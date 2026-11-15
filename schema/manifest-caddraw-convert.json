@@ -12,7 +12,8 @@
         {"from": "dxf", "to": "svg"},
         {"from": "dxf", "to": "pdf"},
         {"from": "dwg", "to": "svg"},
-        {"from": "dwg", "to": "pdf"}
+        {"from": "dwg", "to": "pdf"},
+        {"from": "dwg", "to": "png"}
       ]
     }
   ]

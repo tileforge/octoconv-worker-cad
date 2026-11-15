@@ -3,27 +3,37 @@ package convert
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
 func TestDrawingPairsAdmitDWG(t *testing.T) {
-	want := map[Pair]string{
-		{From: "dwg", To: "svg"}: OperationConvert,
-		{From: "dwg", To: "pdf"}: OperationConvert,
-		{From: "dwg", To: "png"}: OperationRender,
-	}
-	got := map[Pair]string{}
+	got := map[string]bool{}
 	for _, p := range (CADDXFConverter{}).Pairs() {
-		got[p] = OperationConvert
+		got[OperationConvert+" "+p.From+" "+p.To] = true
 	}
 	for _, p := range (CADDXFRenderConverter{}).Pairs() {
-		got[p] = OperationRender
+		got[OperationRender+" "+p.From+" "+p.To] = true
 	}
-	for p, op := range want {
-		if got[p] != op {
-			t.Fatalf("%s to %s is %q", p.From, p.To, got[p])
+	for _, key := range []string{
+		OperationConvert + " dwg svg",
+		OperationConvert + " dwg pdf",
+		OperationConvert + " dwg png",
+		OperationRender + " dwg png",
+		OperationRender + " dxf png",
+	} {
+		if !got[key] {
+			t.Fatalf("missing %s", key)
 		}
+	}
+	if got[OperationConvert+" dxf png"] {
+		t.Fatal("dxf to png is registered as a convert pair")
+	}
+	png, ok := CADStages(OperationConvert, "dwg", "png")
+	render, renderOK := CADStages(OperationRender, "dwg", "png")
+	if !ok || !renderOK || !slices.Equal(png, render) {
+		t.Fatalf("convert png route %v, render png route %v", png, render)
 	}
 }
 
