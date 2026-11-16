@@ -7,6 +7,9 @@ import re
 import sys
 
 FINITE_LIMIT = 1e12
+# Tolerance is 1e-6 because a wider one closes a real gap and invents a volume.
+SEW_TOLERANCE = 1e-6
+SEW_FACE_CAP = 20000
 QUALITY = {"draft": (0.004, 0.5), "standard": (0.001, 0.35), "fine": (0.0003, 0.2)}
 MM_PER_UNIT = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "inch": 25.4, "foot": 304.8, "micrometre": 0.001}
 UNIT_NAMES = {
@@ -341,6 +344,62 @@ def write_draft(path, draft):
         fh.write(text)
 
 
+def shape_count(shape, kind):
+    from OCP.TopExp import TopExp_Explorer
+
+    count = 0
+    explorer = TopExp_Explorer(shape, kind)
+    while explorer.More():
+        count += 1
+        explorer.Next()
+    return count
+
+
+def sew_closed_iges(shape):
+    from OCP.BRep import BRep_Builder, BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid, BRepBuilderAPI_Sewing
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS, TopoDS_Compound
+
+    try:
+        if shape_count(shape, TopAbs_SOLID) > 0:
+            return shape
+        faces = shape_count(shape, TopAbs_FACE)
+        if faces == 0 or faces > SEW_FACE_CAP:
+            return shape
+        sewer = BRepBuilderAPI_Sewing(SEW_TOLERANCE)
+        sewer.SetNonManifoldMode(False)
+        sewer.Load(shape)
+        sewer.Perform()
+        sewed = sewer.SewedShape()
+        if sewed.IsNull() or sewer.NbFreeEdges() > 0 or sewer.NbDeletedFaces() > 0:
+            return shape
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        shells = 0
+        explorer = TopExp_Explorer(sewed, TopAbs_SHELL)
+        while explorer.More():
+            shells += 1
+            shell = TopoDS.Shell(explorer.Current())
+            if not BRep_Tool.IsClosed_s(shell):
+                return shape
+            made = BRepBuilderAPI_MakeSolid(shell)
+            if not made.IsDone():
+                return shape
+            builder.Add(compound, made.Solid())
+            explorer.Next()
+        if shells == 0 or shape_count(compound, TopAbs_FACE) != faces:
+            return shape
+        solids, closed, volume = solid_summary(compound)[:3]
+        if solids > 0 and closed == solids and volume is not None and volume > 0:
+            return compound
+    except Exception as exc:
+        sys.stderr.write("cad-mesh: iges sew: %s: %s\n" % (exc.__class__.__name__, exc))
+    return shape
+
+
 def measure_draft(fmt, src, shape, triangles):
     solids, closed, volume, area, reason, boxes = solid_summary(shape)
     lo, hi = document_box(shape)
@@ -400,6 +459,8 @@ def run(fmt, src, out, fd, quality, measure):
         if diag <= 0:
             verdict(fd, "empty", "zero_size", load_fails=fails)
             return EXIT_EMPTY
+        if fmt == "iges":
+            shape = sew_closed_iges(shape)
 
         linear, angular = QUALITY[quality]
         mesher = BRepMesh_IncrementalMesh(shape, linear * diag, False, angular, False)
