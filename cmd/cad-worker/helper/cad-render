@@ -62,6 +62,93 @@ def unit(a):
     return [x / n for x in a]
 
 
+def silhouette_edges(points, triangles, direction):
+    import numpy as np
+
+    points = np.asarray(points, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int64)
+    direction = np.asarray(direction, dtype=np.float64)
+    empty = np.empty((0, 2), dtype=np.int64)
+    if triangles.size == 0 or points.size == 0:
+        return empty
+    span = np.max(points, axis=0) - np.min(points, axis=0)
+    scale = float(np.dot(span, span))
+    if not scale > 0.0:
+        return empty
+    a = points[triangles[:, 0]]
+    b = points[triangles[:, 1]]
+    c = points[triangles[:, 2]]
+    normal = np.cross(b - a, c - a)
+    valid = np.linalg.norm(normal, axis=1) > 1e-12 * scale
+    if not np.any(valid):
+        return empty
+    front = np.zeros(triangles.shape[0], dtype=bool)
+    front[valid] = normal[valid] @ direction > 0
+    tris = triangles[valid]
+    side = front[valid]
+    pairs = np.sort(np.stack((tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]), axis=1), axis=2)
+    pairs = pairs.reshape(-1, 2)
+    sides = np.repeat(side, 3)
+    keys = pairs[:, 0] * np.int64(points.shape[0]) + pairs[:, 1]
+    order = np.argsort(keys, kind="mergesort")
+    keys = keys[order]
+    pairs = pairs[order]
+    sides = sides[order]
+    cuts = np.flatnonzero(keys[1:] != keys[:-1]) + 1
+    starts = np.empty(cuts.size + 1, dtype=np.int64)
+    starts[0] = 0
+    starts[1:] = cuts
+    counts = np.diff(np.append(starts, len(keys)))
+    front_count = np.add.reduceat(sides.astype(np.int64), starts)
+    keep = (front_count > 0) & (front_count < counts)
+    return pairs[starts[keep]]
+
+
+def consistent_surface(poly):
+    from vtkmodules.vtkFiltersCore import vtkPolyDataNormals
+
+    normals = vtkPolyDataNormals()
+    normals.SetInputData(poly)
+    normals.ConsistencyOn()
+    normals.SplittingOff()
+    normals.AutoOrientNormalsOff()
+    normals.NonManifoldTraversalOn()
+    normals.ComputePointNormalsOff()
+    normals.ComputeCellNormalsOn()
+    normals.Update()
+    return normals.GetOutput()
+
+
+def silhouette_lines(poly, direction):
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+
+    poly = consistent_surface(poly)
+    polys = poly.GetPolys()
+    if polys.GetNumberOfCells() == 0 or poly.GetNumberOfPoints() == 0:
+        return None
+    offsets = vtk_to_numpy(polys.GetOffsetsArray())
+    if offsets.size < 2 or not (offsets[1:] - offsets[:-1] == 3).all():
+        return None
+    points = vtk_to_numpy(poly.GetPoints().GetData())
+    triangles = vtk_to_numpy(polys.GetConnectivityArray()).reshape(-1, 3)
+    edges = silhouette_edges(points, triangles, direction)
+    if edges.size == 0:
+        return None
+    lines = vtkCellArray()
+    for a, b in edges:
+        lines.InsertNextCell(2)
+        lines.InsertCellPoint(int(a))
+        lines.InsertCellPoint(int(b))
+    copied = vtkPoints()
+    copied.DeepCopy(poly.GetPoints())
+    out = vtkPolyData()
+    out.SetPoints(copied)
+    out.SetLines(lines)
+    return out
+
+
 def verdict(fd, args, verdict_name, reason, triangles=0, extra=None):
     obj = {
         "stage": "render",
@@ -158,6 +245,17 @@ def render(fd, args):
     edge.GetProperty().SetLineWidth(max(2.0, args.size / 640.0))
     edge.GetProperty().LightingOff()
 
+    outline = silhouette_lines(clean.GetOutput(), direction)
+    outline_actor = None
+    if outline is not None:
+        outline_mapper = vtkPolyDataMapper()
+        outline_mapper.SetInputData(outline)
+        outline_actor = vtkActor()
+        outline_actor.SetMapper(outline_mapper)
+        outline_actor.GetProperty().SetColor(*EDGE)
+        outline_actor.GetProperty().SetLineWidth(edge.GetProperty().GetLineWidth())
+        outline_actor.GetProperty().LightingOff()
+
     transparent = args.background == "transparent"
     renderer = vtkRenderer()
     renderer.SetBackground(1.0, 1.0, 1.0)
@@ -165,6 +263,8 @@ def render(fd, args):
     renderer.AutomaticLightCreationOff()
     renderer.AddActor(surf)
     renderer.AddActor(edge)
+    if outline_actor is not None:
+        renderer.AddActor(outline_actor)
     for vec, intensity in LIGHTS + REFLECTION_LIGHTS:
         light = vtkLight()
         light.SetLightTypeToSceneLight()
