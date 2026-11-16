@@ -71,11 +71,15 @@ def silhouette_edges(points, triangles, direction):
     empty = np.empty((0, 2), dtype=np.int64)
     if triangles.size == 0 or points.size == 0:
         return empty
+    span = np.max(points, axis=0) - np.min(points, axis=0)
+    scale = float(np.dot(span, span))
+    if not scale > 0.0:
+        return empty
     a = points[triangles[:, 0]]
     b = points[triangles[:, 1]]
     c = points[triangles[:, 2]]
     normal = np.cross(b - a, c - a)
-    valid = np.linalg.norm(normal, axis=1) > 1e-12
+    valid = np.linalg.norm(normal, axis=1) > 1e-12 * scale
     if not np.any(valid):
         return empty
     front = np.zeros(triangles.shape[0], dtype=bool)
@@ -100,10 +104,27 @@ def silhouette_edges(points, triangles, direction):
     return pairs[starts[keep]]
 
 
+def consistent_surface(poly):
+    from vtkmodules.vtkFiltersCore import vtkPolyDataNormals
+
+    normals = vtkPolyDataNormals()
+    normals.SetInputData(poly)
+    normals.ConsistencyOn()
+    normals.SplittingOff()
+    normals.AutoOrientNormalsOff()
+    normals.NonManifoldTraversalOn()
+    normals.ComputePointNormalsOff()
+    normals.ComputeCellNormalsOn()
+    normals.Update()
+    return normals.GetOutput()
+
+
 def silhouette_lines(poly, direction):
     from vtkmodules.util.numpy_support import vtk_to_numpy
+    from vtkmodules.vtkCommonCore import vtkPoints
     from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
 
+    poly = consistent_surface(poly)
     polys = poly.GetPolys()
     if polys.GetNumberOfCells() == 0 or poly.GetNumberOfPoints() == 0:
         return None
@@ -120,8 +141,10 @@ def silhouette_lines(poly, direction):
         lines.InsertNextCell(2)
         lines.InsertCellPoint(int(a))
         lines.InsertCellPoint(int(b))
+    copied = vtkPoints()
+    copied.DeepCopy(poly.GetPoints())
     out = vtkPolyData()
-    out.SetPoints(poly.GetPoints())
+    out.SetPoints(copied)
     out.SetLines(lines)
     return out
 

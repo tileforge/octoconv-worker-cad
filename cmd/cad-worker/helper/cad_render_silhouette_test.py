@@ -28,6 +28,29 @@ def test_two_front_faces_have_no_silhouette(render):
     assert edges.size == 0
 
 
+def test_a_small_mesh_keeps_its_silhouette(render):
+    points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=np.float64) * 1e-8
+    triangles = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    edges = render.silhouette_edges(points, triangles, (0, 0, 1))
+    assert edges.tolist() == [[0, 2]], edges.tolist()
+
+
+def test_opposite_winding_on_one_plane_is_not_a_silhouette(render):
+    points = vtkPoints()
+    for xyz in ((0, 0, 0), (1, 0, 0), (0.5, 1, 0), (0.5, -1, 0)):
+        points.InsertNextPoint(*xyz)
+    cells = vtkCellArray()
+    for ids in ((0, 1, 2), (0, 1, 3)):
+        tri = vtkTriangle()
+        for i, point in enumerate(ids):
+            tri.GetPointIds().SetId(i, point)
+        cells.InsertNextCell(tri)
+    poly = vtkPolyData()
+    poly.SetPoints(points)
+    poly.SetPolys(cells)
+    assert render.silhouette_lines(poly, (0, 0, 1)) is None
+
+
 def test_a_boundary_is_not_a_silhouette(render):
     points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float64)
     triangles = np.array([[0, 1, 2]], dtype=np.int64)
@@ -81,6 +104,8 @@ def main():
     test_shared_edge_of_opposite_faces_is_a_silhouette(render)
     test_two_front_faces_have_no_silhouette(render)
     test_a_boundary_is_not_a_silhouette(render)
+    test_a_small_mesh_keeps_its_silhouette(render)
+    test_opposite_winding_on_one_plane_is_not_a_silhouette(render)
     test_polydata_lines_use_the_same_edge(render)
     test_render_keeps_a_folded_pair(render)
     print("ok")
