@@ -149,9 +149,8 @@ func cadDimensionLines(points [8]cadPoint, box measurements.BBox) []cadDimension
 	return lines
 }
 
-func cadBodyDimensionLines(mesh stlBounds, doc measurements.Document, view string, frame image.Rectangle) []cadDimensionLine {
-	scale, ok := cadDisplayToMesh(mesh, doc.BBox)
-	if !ok {
+func cadBodyDimensionLines(mesh stlBounds, doc measurements.Document, view string, frame image.Rectangle, factor float64) []cadDimensionLine {
+	if !(factor > 0) || math.IsNaN(factor) || math.IsInf(factor, 0) {
 		return nil
 	}
 	ranked := make([]int, 0, len(doc.Bodies))
@@ -177,30 +176,13 @@ func cadBodyDimensionLines(mesh stlBounds, doc measurements.Document, view strin
 	cam := cadDimensionViewOf(mesh, view, frame)
 	lines := make([]cadDimensionLine, 0, len(ranked)*3)
 	for _, i := range ranked {
-		body, ok := cadBoxInMesh(doc.Bodies[i].BBox, scale)
+		body, ok := cadBoxInMesh(doc.Bodies[i].BBox, factor)
 		if !ok {
 			continue
 		}
 		lines = append(lines, cadDimensionLines(cam.project(body), doc.Bodies[i].BBox)...)
 	}
 	return lines
-}
-
-func cadDisplayToMesh(mesh stlBounds, box measurements.BBox) (float64, bool) {
-	var scale, best float64
-	for axis := range 3 {
-		if axis >= len(box.Min) || axis >= len(box.Max) {
-			return 0, false
-		}
-		docSpan := box.Max[axis] - box.Min[axis]
-		meshSpan := mesh.Max[axis] - mesh.Min[axis]
-		if !(docSpan > 0) || !(meshSpan > 0) || docSpan <= best {
-			continue
-		}
-		best = docSpan
-		scale = meshSpan / docSpan
-	}
-	return scale, best > 0
 }
 
 func cadBoxInMesh(box measurements.BBox, scale float64) (stlBounds, bool) {
@@ -232,15 +214,16 @@ func cadBoxNear(a, b measurements.BBox) bool {
 		return false
 	}
 	for axis := range 3 {
-		if !cadNear(a.Min[axis], b.Min[axis]) || !cadNear(a.Max[axis], b.Max[axis]) {
+		span := math.Max(math.Abs(a.Max[axis]-a.Min[axis]), math.Abs(b.Max[axis]-b.Min[axis]))
+		if !cadNearBoxCoord(a.Min[axis], b.Min[axis], span) || !cadNearBoxCoord(a.Max[axis], b.Max[axis], span) {
 			return false
 		}
 	}
 	return true
 }
 
-func cadNear(a, b float64) bool {
-	return math.Abs(a-b) <= 1e-6*math.Max(1, math.Max(math.Abs(a), math.Abs(b)))
+func cadNearBoxCoord(a, b, span float64) bool {
+	return math.Abs(a-b) <= 1e-6*math.Max(span, 1e-9)
 }
 
 func cadBoxDiagonal(box measurements.BBox) float64 {
@@ -283,6 +266,7 @@ func cadDimensionImage(
 	bounds stlBounds,
 	doc measurements.Document,
 	opts CADOpts,
+	factor float64,
 ) (image.Image, error) {
 	size := *opts.Size
 	dst := image.NewRGBA(image.Rect(0, 0, size, size))
@@ -309,7 +293,7 @@ func cadDimensionImage(
 	for _, line := range cadDimensionLines(points, doc.BBox) {
 		pen.dimension(line, face, textSize)
 	}
-	for _, line := range cadBodyDimensionLines(bounds, doc, opts.View, frame) {
+	for _, line := range cadBodyDimensionLines(bounds, doc, opts.View, frame, factor) {
 		pen.dimension(line, face, textSize)
 	}
 	title := cadDimensionTitle(doc)

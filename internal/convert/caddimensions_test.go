@@ -31,7 +31,7 @@ func TestBodyDimensionsSitOnTheOverallCamera(t *testing.T) {
 	overall := measurements.BBox{Min: []float64{0, 0, 0}, Max: []float64{2, 2, 2}}
 	part := measurements.BBox{Min: []float64{1, 1, 1}, Max: []float64{2, 2, 2}}
 	doc := measurements.Document{BBox: overall, Bodies: []measurements.Body{{BBox: part}}}
-	lines := cadBodyDimensionLines(mesh, doc, "front", frame)
+	lines := cadBodyDimensionLines(mesh, doc, "front", frame, 1)
 	if len(lines) != 2 {
 		t.Fatalf("lines = %d, want the two visible axes", len(lines))
 	}
@@ -57,7 +57,7 @@ func TestBodyDimensionsUseTheDisplayUnit(t *testing.T) {
 		}}},
 	}
 	frame := image.Rect(0, 0, 100, 100)
-	lines := cadBodyDimensionLines(mesh, doc, "front", frame)
+	lines := cadBodyDimensionLines(mesh, doc, "front", frame, 25.4)
 	if len(lines) != 2 || lines[0].Value != "1.0" || lines[1].Value != "1.0" {
 		t.Fatalf("lines = %+v", lines)
 	}
@@ -98,7 +98,7 @@ func TestBodyDimensionsSkipTheOverallBoxAndTheSmallest(t *testing.T) {
 	}
 	mesh := stlBounds{Min: [3]float64{0, 0, 0}, Max: [3]float64{100, 100, 100}}
 	frame := image.Rect(0, 0, 200, 200)
-	if lines := cadBodyDimensionLines(mesh, doc, "iso", frame); len(lines) != 0 {
+	if lines := cadBodyDimensionLines(mesh, doc, "iso", frame, 1); len(lines) != 0 {
 		t.Fatalf("overall body drew %d lines", len(lines))
 	}
 	doc.Bodies = nil
@@ -108,7 +108,7 @@ func TestBodyDimensionsSkipTheOverallBoxAndTheSmallest(t *testing.T) {
 			Min: []float64{0, 0, 0}, Max: []float64{span, span, span},
 		}})
 	}
-	lines := cadBodyDimensionLines(mesh, doc, "iso", frame)
+	lines := cadBodyDimensionLines(mesh, doc, "iso", frame, 1)
 	seen := map[string]bool{}
 	for _, line := range lines {
 		seen[line.Value] = true
@@ -121,20 +121,46 @@ func TestBodyDimensionsSkipTheOverallBoxAndTheSmallest(t *testing.T) {
 	}
 }
 
-func TestBodyDimensionsFollowTheLongestAxisWhenTheMeshIsInset(t *testing.T) {
-	mesh := stlBounds{Min: [3]float64{0, 0, 0}, Max: [3]float64{100, 100, 99.5}}
+func TestBodyDimensionsKeepFarBoxesOnTheUnitFactor(t *testing.T) {
+	const origin = 1000000.0
+	mesh := stlBounds{
+		Min: [3]float64{origin, origin, origin},
+		Max: [3]float64{origin + 99.5, origin + 99.5, origin + 99.5},
+	}
 	doc := measurements.Document{
-		BBox: measurements.BBox{Min: []float64{0, 0, 0}, Max: []float64{100, 100, 100}},
+		BBox: measurements.BBox{
+			Min: []float64{origin, origin, origin},
+			Max: []float64{origin + 100, origin + 100, origin + 100},
+		},
 		Bodies: []measurements.Body{{BBox: measurements.BBox{
-			Min: []float64{0, 0, 0}, Max: []float64{50, 50, 50},
+			Min: []float64{origin, origin, origin},
+			Max: []float64{origin + 50, origin + 50, origin + 50},
 		}}},
 	}
 	frame := image.Rect(0, 0, 100, 100)
-	lines := cadBodyDimensionLines(mesh, doc, "front", frame)
+	lines := cadBodyDimensionLines(mesh, doc, "front", frame, 1)
 	points := cadDimensionViewOf(mesh, "front", frame).project(stlBounds{
-		Min: [3]float64{0, 0, 0}, Max: [3]float64{50, 50, 50},
+		Min: [3]float64{origin, origin, origin},
+		Max: [3]float64{origin + 50, origin + 50, origin + 50},
 	})
-	if len(lines) != 2 || !lineOnProjectedEdge(lines[0], points) {
-		t.Fatalf("inset mesh lines = %+v", lines)
+	if len(lines) != 2 || !lineOnProjectedEdge(lines[0], points) || !lineOnProjectedEdge(lines[1], points) {
+		t.Fatalf("far body lines = %+v", lines)
+	}
+
+	smaller := measurements.BBox{
+		Min: []float64{origin + 0.5, origin + 0.5, origin + 0.5},
+		Max: []float64{origin + 9.5, origin + 9.5, origin + 9.5},
+	}
+	doc.BBox = measurements.BBox{
+		Min: []float64{origin, origin, origin},
+		Max: []float64{origin + 10, origin + 10, origin + 10},
+	}
+	doc.Bodies = []measurements.Body{{BBox: smaller}}
+	mesh = stlBounds{
+		Min: [3]float64{origin, origin, origin},
+		Max: [3]float64{origin + 10, origin + 10, origin + 10},
+	}
+	if lines := cadBodyDimensionLines(mesh, doc, "front", image.Rect(0, 0, 400, 400), 1); len(lines) == 0 {
+		t.Fatal("a smaller far box was treated as the overall box")
 	}
 }

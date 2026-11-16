@@ -142,7 +142,11 @@ func (c CADRenderConverter) ConvertWithStages(ctx context.Context, inPath, outPa
 		if err != nil {
 			return err
 		}
-		annotated, err := cadDimensionImage(model, meshBounds, doc, o)
+		_, _, factor, factorErr := cadUnitFor(draft, o.AssumeUnit)
+		if factorErr != nil {
+			return fmt.Errorf("cad: %w: %v", ErrCADMeasurementsInvalid, factorErr)
+		}
+		annotated, err := cadDimensionImage(model, meshBounds, doc, o, factor)
 		if err != nil {
 			return fmt.Errorf("cad: annotate dimensions: %w", err)
 		}
