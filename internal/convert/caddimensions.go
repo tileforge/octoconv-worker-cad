@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -30,9 +31,18 @@ type cadDimensionLine struct {
 	Value      string
 }
 
+const cadMaxBodyDimensions = 12
+
 // Match the orthographic camera in cmd/cad-worker/helper/cad-render. Bounds
 // position lines in mesh coordinates; the document supplies values in display units.
-func cadDimensionProjection(b stlBounds, view string, frame image.Rectangle) [8]cadPoint {
+type cadDimensionView struct {
+	right, up [3]float64
+	origin    [3]float64
+	scale     float64
+	center    cadPoint
+}
+
+func cadDimensionViewOf(b stlBounds, view string, frame image.Rectangle) cadDimensionView {
 	var right, up [3]float64
 	switch view {
 	case "front":
@@ -51,34 +61,68 @@ func cadDimensionProjection(b stlBounds, view string, frame image.Rectangle) [8]
 		right = [3]float64{1 / math.Sqrt2, 1 / math.Sqrt2, 0}
 		up = [3]float64{-1 / math.Sqrt(6), 1 / math.Sqrt(6), 2 / math.Sqrt(6)}
 	}
-	var points [8]cadPoint
-	var half float64
-	for corner := range points {
-		for axis := range 3 {
-			d := (b.Max[axis] - b.Min[axis]) / 2
-			if corner&(1<<axis) == 0 {
-				d = -d
-			}
-			points[corner][0] += d * right[axis]
-			points[corner][1] -= d * up[axis]
-		}
-		half = max(half, math.Abs(points[corner][0]), math.Abs(points[corner][1]))
+	origin := [3]float64{
+		(b.Min[0] + b.Max[0]) / 2,
+		(b.Min[1] + b.Max[1]) / 2,
+		(b.Min[2] + b.Max[2]) / 2,
 	}
-	center := cadPoint{float64(frame.Min.X+frame.Max.X) / 2, float64(frame.Min.Y+frame.Max.Y) / 2}
-	var scale float64
+	var half float64
+	for corner := range 8 {
+		p := cadCornerOffset(b, corner, right, up)
+		half = max(half, math.Abs(p[0]), math.Abs(p[1]))
+	}
+	cam := cadDimensionView{right: right, up: up, origin: origin, center: cadPoint{
+		float64(frame.Min.X+frame.Max.X) / 2,
+		float64(frame.Min.Y+frame.Max.Y) / 2,
+	}}
 	if half > 0 {
 		// The raw renderer leaves 6% on each side of its square frame.
-		scale = float64(frame.Dx()) * 0.88 / (2 * half)
+		cam.scale = float64(frame.Dx()) * 0.88 / (2 * half)
 	}
-	for i, p := range points {
-		points[i] = center.add(p.mul(scale))
+	return cam
+}
+
+func cadCornerOffset(b stlBounds, corner int, right, up [3]float64) cadPoint {
+	var p cadPoint
+	for axis := range 3 {
+		d := (b.Max[axis] - b.Min[axis]) / 2
+		if corner&(1<<axis) == 0 {
+			d = -d
+		}
+		p[0] += d * right[axis]
+		p[1] -= d * up[axis]
+	}
+	return p
+}
+
+func cadDimensionProjection(b stlBounds, view string, frame image.Rectangle) [8]cadPoint {
+	return cadDimensionViewOf(b, view, frame).project(b)
+}
+
+func (cam cadDimensionView) project(b stlBounds) [8]cadPoint {
+	var points [8]cadPoint
+	for corner := range points {
+		var p cadPoint
+		for axis := range 3 {
+			coord := b.Max[axis]
+			if corner&(1<<axis) == 0 {
+				coord = b.Min[axis]
+			}
+			d := coord - cam.origin[axis]
+			p[0] += d * cam.right[axis]
+			p[1] -= d * cam.up[axis]
+		}
+		points[corner] = cam.center.add(p.mul(cam.scale))
 	}
 	return points
 }
 
-func cadDimensionLines(points [8]cadPoint, doc measurements.Document) []cadDimensionLine {
+func cadDimensionLines(points [8]cadPoint, box measurements.BBox) []cadDimensionLine {
 	lines := make([]cadDimensionLine, 0, 3)
 	for axis := range 3 {
+		if axis >= len(box.Min) || axis >= len(box.Max) {
+			continue
+		}
 		v := points[1<<axis].add(points[0].mul(-1))
 		length := math.Hypot(v[0], v[1])
 		if length < 1 {
@@ -99,10 +143,96 @@ func cadDimensionLines(points [8]cadPoint, doc measurements.Document) []cadDimen
 		}
 		lines = append(lines, cadDimensionLine{
 			Start: points[best], End: points[best|(1<<axis)], Normal: normal,
-			Value: cadDimensionNumber(doc.BBox.Max[axis] - doc.BBox.Min[axis]),
+			Value: cadDimensionNumber(box.Max[axis] - box.Min[axis]),
 		})
 	}
 	return lines
+}
+
+func cadBodyDimensionLines(mesh stlBounds, doc measurements.Document, view string, frame image.Rectangle, factor float64) []cadDimensionLine {
+	if !(factor > 0) || math.IsNaN(factor) || math.IsInf(factor, 0) {
+		return nil
+	}
+	ranked := make([]int, 0, len(doc.Bodies))
+	for i, body := range doc.Bodies {
+		if cadBoxNear(body.BBox, doc.BBox) || !cadBoxFinite(body.BBox) {
+			continue
+		}
+		ranked = append(ranked, i)
+	}
+	slices.SortStableFunc(ranked, func(a, b int) int {
+		da, db := cadBoxDiagonal(doc.Bodies[a].BBox), cadBoxDiagonal(doc.Bodies[b].BBox)
+		if da > db {
+			return -1
+		}
+		if da < db {
+			return 1
+		}
+		return a - b
+	})
+	if len(ranked) > cadMaxBodyDimensions {
+		ranked = ranked[:cadMaxBodyDimensions]
+	}
+	cam := cadDimensionViewOf(mesh, view, frame)
+	lines := make([]cadDimensionLine, 0, len(ranked)*3)
+	for _, i := range ranked {
+		body, ok := cadBoxInMesh(doc.Bodies[i].BBox, factor)
+		if !ok {
+			continue
+		}
+		lines = append(lines, cadDimensionLines(cam.project(body), doc.Bodies[i].BBox)...)
+	}
+	return lines
+}
+
+func cadBoxInMesh(box measurements.BBox, scale float64) (stlBounds, bool) {
+	if len(box.Min) != 3 || len(box.Max) != 3 {
+		return stlBounds{}, false
+	}
+	var b stlBounds
+	for axis := range 3 {
+		b.Min[axis] = box.Min[axis] * scale
+		b.Max[axis] = box.Max[axis] * scale
+	}
+	return b, true
+}
+
+func cadBoxFinite(box measurements.BBox) bool {
+	if len(box.Min) != 3 || len(box.Max) != 3 {
+		return false
+	}
+	for axis := range 3 {
+		if math.IsNaN(box.Min[axis]) || math.IsInf(box.Min[axis], 0) || math.IsNaN(box.Max[axis]) || math.IsInf(box.Max[axis], 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func cadBoxNear(a, b measurements.BBox) bool {
+	if len(a.Min) != 3 || len(a.Max) != 3 || len(b.Min) != 3 || len(b.Max) != 3 {
+		return false
+	}
+	for axis := range 3 {
+		span := math.Max(math.Abs(a.Max[axis]-a.Min[axis]), math.Abs(b.Max[axis]-b.Min[axis]))
+		if !cadNearBoxCoord(a.Min[axis], b.Min[axis], span) || !cadNearBoxCoord(a.Max[axis], b.Max[axis], span) {
+			return false
+		}
+	}
+	return true
+}
+
+func cadNearBoxCoord(a, b, span float64) bool {
+	return math.Abs(a-b) <= 1e-6*math.Max(span, 1e-9)
+}
+
+func cadBoxDiagonal(box measurements.BBox) float64 {
+	var sum float64
+	for axis := range 3 {
+		d := box.Max[axis] - box.Min[axis]
+		sum += d * d
+	}
+	return math.Sqrt(sum)
 }
 
 func cadDimensionNumber(v float64) string {
@@ -136,6 +266,7 @@ func cadDimensionImage(
 	bounds stlBounds,
 	doc measurements.Document,
 	opts CADOpts,
+	factor float64,
 ) (image.Image, error) {
 	size := *opts.Size
 	dst := image.NewRGBA(image.Rect(0, 0, size, size))
@@ -159,7 +290,10 @@ func cadDimensionImage(
 	ink := image.NewUniform(color.RGBA{R: 74, G: 87, B: 94, A: 255})
 	pen := cadDimensionPen{image: dst, ink: ink, width: max(0.8, float64(size)/1100)}
 	points := cadDimensionProjection(bounds, opts.View, frame)
-	for _, line := range cadDimensionLines(points, doc) {
+	for _, line := range cadDimensionLines(points, doc.BBox) {
+		pen.dimension(line, face, textSize)
+	}
+	for _, line := range cadBodyDimensionLines(bounds, doc, opts.View, frame, factor) {
 		pen.dimension(line, face, textSize)
 	}
 	title := cadDimensionTitle(doc)
