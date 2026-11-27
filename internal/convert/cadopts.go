@@ -26,6 +26,9 @@ var (
 	cadQualities   = map[string]bool{"draft": true, "standard": true, "fine": true}
 	cadBackgrounds = map[string]bool{"opaque": true, "transparent": true}
 	cadUnits       = map[string]bool{"mm": true, "cm": true, "m": true, "inch": true, "foot": true, "micrometre": true}
+	cadMaterials   = map[string]bool{"steel": true, "copper": true, "aluminum": true}
+	cadColors      = map[string]bool{"natural": true, "blue": true, "black": true}
+	cadFinishes    = map[string]bool{"bare": true, "polished": true, "anodized": true, "matte_powder_coat": true}
 )
 
 type CADOpts struct {
@@ -35,6 +38,9 @@ type CADOpts struct {
 	Background string `json:"background,omitempty"`
 	AssumeUnit string `json:"assume_unit,omitempty"`
 	Dimensions *bool  `json:"dimensions,omitempty"`
+	Material   string `json:"material,omitempty"`
+	Color      string `json:"color,omitempty"`
+	Finish     string `json:"finish,omitempty"`
 	Layout     string `json:"layout,omitempty"`
 }
 
@@ -73,6 +79,24 @@ func ParseCADOpts(raw []byte) (CADOpts, error) {
 				return CADOpts{}, err
 			}
 			o.AssumeUnit = s
+		case "material":
+			s, err := cadClosedString(key, value, cadMaterials)
+			if err != nil {
+				return CADOpts{}, err
+			}
+			o.Material = s
+		case "color":
+			s, err := cadClosedString(key, value, cadColors)
+			if err != nil {
+				return CADOpts{}, err
+			}
+			o.Color = s
+		case "finish":
+			s, err := cadClosedString(key, value, cadFinishes)
+			if err != nil {
+				return CADOpts{}, err
+			}
+			o.Finish = s
 		case "size":
 			n, err := cadSize(value)
 			if err != nil {
@@ -171,6 +195,15 @@ func (o CADOpts) Resolved() CADOpts {
 	if o.Background == "" {
 		o.Background = CADBackgroundOpq
 	}
+	if o.Material == "" {
+		o.Material = "steel"
+	}
+	if o.Color == "" {
+		o.Color = "natural"
+	}
+	if o.Finish == "" {
+		o.Finish = "bare"
+	}
 	if o.Dimensions == nil {
 		enabled := true
 		o.Dimensions = &enabled
@@ -190,6 +223,11 @@ func ValidateCADApplicability(engine, operation, source, target string, o CADOpt
 		return fmt.Errorf("cad options are only valid for cad-engine conversions")
 	}
 	format := NormalizeFormat(source)
+	if o.Material != "" || o.Color != "" || o.Finish != "" {
+		if operation != OperationRender || (format != "step" && format != "iges" && format != "stl") || NormalizeFormat(target) != "png" {
+			return fmt.Errorf("material, color and finish apply only to 3D CAD renders")
+		}
+	}
 	if format == "dxf" || format == "dwg" {
 		switch {
 		case operation == OperationConvert:

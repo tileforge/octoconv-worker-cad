@@ -190,6 +190,9 @@ func (c CADRenderConverter) renderStage(ctx context.Context, jobDir, inPath, out
 		"--view", o.View,
 		"--size", strconv.Itoa(*o.Size),
 		"--background", o.Background,
+		"--material", o.Material,
+		"--color", o.Color,
+		"--finish", o.Finish,
 		inPath, outPath)
 	v, err := classifyCADStage(cadStageRender, ctx, stageCtx, timeout, out, cpu, err)
 	if err != nil {

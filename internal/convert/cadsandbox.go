@@ -317,7 +317,7 @@ func cadPreflightRender(ctx context.Context, r CADRenderConverter, w preflightWo
 	size := cadPreflightFrame
 	for _, background := range []string{CADBackgroundOpq, CADBackgroundTr} {
 		path := filepath.Join(w.jobDir, "preflight-"+background+".png")
-		o := CADOpts{View: CADViewIso, Size: &size, Background: background}
+		o := CADOpts{Size: &size, Background: background}.Resolved()
 		if err := r.renderStage(ctx, w.jobDir, stl, path, o); err != nil {
 			return fmt.Errorf("the cad render stage cannot render a file inside the job directory (%s) under its sandbox: %w", background, err)
 		}
@@ -352,7 +352,7 @@ func cadPreflightRenderDenied(ctx context.Context, r CADRenderConverter, w prefl
 	}
 	size := cadPreflightFrame
 	outPNG := filepath.Join(w.jobDir, "neg.png")
-	err = r.renderStage(ctx, w.jobDir, outsideSTL, outPNG, CADOpts{View: CADViewIso, Size: &size, Background: CADBackgroundOpq})
+	err = r.renderStage(ctx, w.jobDir, outsideSTL, outPNG, CADOpts{Size: &size}.Resolved())
 	if err := requireCADDenied("cad render", err); err != nil {
 		return err
 	}

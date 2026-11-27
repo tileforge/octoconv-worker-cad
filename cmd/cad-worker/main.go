@@ -1,4 +1,4 @@
-// Command cad-worker runs one approved cad capability over Worker Protocol v1.
+// Command cad-worker runs one approved cad capability over Worker Protocol v2.
 package main
 
 import (

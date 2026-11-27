@@ -673,3 +673,103 @@ func TestReadLimitedJobFileHonorsAssignmentCap(t *testing.T) {
 		t.Fatalf("readLimitedJobFile: %v", err)
 	}
 }
+
+// Echoes the options into the primary artifact so the test observes the converter boundary.
+type optionsRenderConverter struct{ convert.CADRenderConverter }
+
+func (optionsRenderConverter) Pairs() []convert.Pair {
+	return []convert.Pair{{From: "step", To: "png"}, {From: "stl", To: "png"}, {From: "dxf", To: "png"}}
+}
+
+func (optionsRenderConverter) Convert(_ context.Context, _, output string, opts map[string]any) error {
+	body, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(output, body, 0o600)
+}
+
+func TestProtocolModelRenderParameters(t *testing.T) {
+	old := convert.Default
+	convert.Default = convert.NewRegistry()
+	t.Cleanup(func() { convert.Default = old })
+	convert.Default.Register(optionsRenderConverter{})
+	const custom = `{"color":"blue","dimensions":false,"finish":"anodized","material":"aluminum","size":512}`
+	for _, tc := range []struct {
+		name, cap, from           string
+		version                   int
+		raw, wantOutput, errorKey string
+	}{
+		{"surface and render options", "cad", "step", 2, custom, custom, ""},
+		{"omitted", "cad", "step", 2, "", "null", ""},
+		{"drawing stays optionless", "caddraw", "dxf", 1, custom, "null", ""},
+		{"previous manifest", "cad", "step", 1, custom, "null", ""},
+		{"invalid material", "cad", "step", 2, `{"material":"silver"}`, "", "material"},
+		{"quality on STL", "cad", "stl", 2, `{"quality":"fine"}`, "", "quality"},
+		{"invalid object", "cad", "step", 2, `[]`, "", "object"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upload := make(chan string, 1)
+			failure := make(chan failJSON, 1)
+			c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet:
+					_, _ = io.WriteString(w, "model")
+				case r.Method == http.MethodPut:
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+					}
+					upload <- string(body)
+				case strings.HasSuffix(r.URL.Path, "/fail"):
+					var body failJSON
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					failure <- body
+				default:
+					var msg struct {
+						Version int `json:"protocol_version"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&msg); err != nil || msg.Version != 2 {
+						t.Errorf("%s protocol version = %d, %v; want 2", r.URL.Path, msg.Version, err)
+					}
+				}
+			}), nil)
+			c.operation = convert.OperationRender
+			c.fileHTTP = c.coreHTTP
+			c.engineLimit = time.Minute
+			href := c.core.String() + "/objects"
+			asgn := assignmentJSON{
+				AttemptID:         "attempt",
+				AttemptToken:      "token",
+				CapabilityID:      "octoconv.render." + tc.cap,
+				CapabilityVersion: tc.version,
+				AttemptDeadline:   time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				LeaseExpiresAt:    time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+				Inputs:            []fileLinkJSON{{Role: "source", Format: tc.from, Href: href}},
+				Outputs:           []fileLinkJSON{{Role: "primary", Format: "png", Href: href}},
+			}
+			if tc.raw != "" {
+				if err := json.Unmarshal([]byte(`{"parameters":`+tc.raw+`}`), &asgn); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := c.runAssignment(t.Context(), asgn, controlJSON{}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case body := <-failure:
+				if tc.errorKey == "" || body.ProtocolVersion != 2 || body.EngineCode != "invalid_options" || !strings.Contains(body.Message, tc.errorKey) {
+					t.Fatalf("unexpected failure: %+v", body)
+				}
+			case body := <-upload:
+				if tc.errorKey != "" || body != tc.wantOutput {
+					t.Fatalf("converter got %s; want %s", body, tc.wantOutput)
+				}
+			default:
+				t.Fatal("assignment produced neither artifact nor failure")
+			}
+		})
+	}
+}
