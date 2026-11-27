@@ -25,6 +25,9 @@ import (
 )
 
 const (
+	protocolVersion     = 2
+	protocolVersionBody = `{"protocol_version":2}`
+
 	envProtocolCoreURL  = "CAD_PROTOCOL_CORE_URL"
 	envProtocolCert     = "CAD_PROTOCOL_CLIENT_CERT"
 	envProtocolKey      = "CAD_PROTOCOL_CLIENT_KEY"
@@ -372,7 +375,7 @@ func heartbeatEvery(seconds int) time.Duration {
 }
 
 func (c *protocolClient) heartbeatLoop(ctx context.Context) {
-	body := []byte(`{"protocol_version":1}`)
+	body := []byte(protocolVersionBody)
 	timer := time.NewTimer(c.beatEvery)
 	defer timer.Stop()
 	for {
@@ -482,7 +485,7 @@ func (c *protocolClient) deleteSession(ctx context.Context) error {
 		c.coreHTTP,
 		http.MethodDelete,
 		target,
-		[]byte(`{"protocol_version":1}`),
+		[]byte(protocolVersionBody),
 		c.sessionToken,
 		"",
 		"",
@@ -522,7 +525,7 @@ type helloRequestJSON struct {
 
 func (c *protocolClient) hello(ctx context.Context) (helloJSON, error) {
 	body, err := json.Marshal(helloRequestJSON{
-		ProtocolVersion: 1,
+		ProtocolVersion: protocolVersion,
 		WorkerID:        c.workerID.String(),
 		ManifestSHA256:  c.manifestSHA,
 		FreeSlots:       c.freeSlots,
@@ -561,17 +564,18 @@ type fileLinkJSON struct {
 }
 
 type assignmentJSON struct {
-	JobID             string         `json:"job_id"`
-	StepID            string         `json:"step_id"`
-	AttemptID         string         `json:"attempt_id"`
-	AttemptToken      string         `json:"attempt_token"`
-	CapabilityID      string         `json:"capability_id"`
-	CapabilityVersion int            `json:"capability_version"`
-	AttemptDeadline   string         `json:"attempt_deadline"`
-	LeaseExpiresAt    string         `json:"lease_expires_at"`
-	Limits            limitsJSON     `json:"limits"`
-	Inputs            []fileLinkJSON `json:"inputs"`
-	Outputs           []fileLinkJSON `json:"outputs"`
+	JobID             string          `json:"job_id"`
+	StepID            string          `json:"step_id"`
+	AttemptID         string          `json:"attempt_id"`
+	AttemptToken      string          `json:"attempt_token"`
+	CapabilityID      string          `json:"capability_id"`
+	CapabilityVersion int             `json:"capability_version"`
+	AttemptDeadline   string          `json:"attempt_deadline"`
+	LeaseExpiresAt    string          `json:"lease_expires_at"`
+	Limits            limitsJSON      `json:"limits"`
+	Inputs            []fileLinkJSON  `json:"inputs"`
+	Outputs           []fileLinkJSON  `json:"outputs"`
+	Parameters        json.RawMessage `json:"parameters,omitempty"`
 }
 
 type limitsJSON struct {
@@ -592,7 +596,7 @@ func (c *protocolClient) pull(ctx context.Context) (pullResponseJSON, error) {
 		wait = 20
 	}
 	body, err := json.Marshal(pullRequestJSON{
-		ProtocolVersion: 1,
+		ProtocolVersion: protocolVersion,
 		PullRequestID:   uuid.NewString(),
 		FreeSlots:       c.freeSlots,
 		WaitSeconds:     wait,
@@ -665,6 +669,10 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	if err != nil {
 		return c.fail(ctx, asgn, "engine_error", "assignment")
 	}
+	opts, err := asgn.renderOptions(c.operation, in.Format, out.Format)
+	if err != nil {
+		return c.fail(ctx, asgn, "invalid_options", safeMessage(err))
+	}
 
 	bounded, cancelDeadline := context.WithDeadline(ctx, deadline)
 	attemptCtx, cancelAttempt := context.WithCancelCause(bounded)
@@ -700,7 +708,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		return err
 	}
 
-	produced, measured, err := c.convert(attemptCtx, in.Format, out.Format, src, deadline, asgn.Limits.MaxOutputBytes)
+	produced, measured, err := c.convert(attemptCtx, in.Format, out.Format, src, deadline, asgn.Limits.MaxOutputBytes, opts)
 	if done, stopErr := c.alreadyStopped(ctx, &flag); done {
 		return stopErr
 	}
@@ -748,7 +756,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		return nil
 	}
 	completeBody, err := json.Marshal(completeJSON{
-		ProtocolVersion: 1,
+		ProtocolVersion: protocolVersion,
 		Artifacts:       artifacts,
 	})
 	if err != nil {
@@ -807,7 +815,24 @@ func assignmentOutputs(links []fileLinkJSON) (fileLinkJSON, *fileLinkJSON, bool)
 	return primary, measurements, true
 }
 
-func (c *protocolClient) convert(ctx context.Context, from, to string, src []byte, deadline time.Time, maxOut int64) ([]byte, []byte, error) {
+func (a assignmentJSON) renderOptions(operation, from, to string) (map[string]any, error) {
+	// Earlier model manifests and the drawing and conversion workers consume no parameters.
+	if len(a.Parameters) == 0 || operation != convert.OperationRender || a.CapabilityID != "octoconv.render.cad" || a.CapabilityVersion != 2 {
+		return nil, nil
+	}
+	parsed, err := convert.ParseCADOpts(a.Parameters)
+	if err != nil {
+		return nil, err
+	}
+	if err := convert.ValidateCADApplicability(convert.EngineCAD, operation, from, to, parsed); err != nil {
+		return nil, err
+	}
+	var opts map[string]any
+	err = json.Unmarshal(a.Parameters, &opts)
+	return opts, err
+}
+
+func (c *protocolClient) convert(ctx context.Context, from, to string, src []byte, deadline time.Time, maxOut int64, opts map[string]any) ([]byte, []byte, error) {
 	conv, ok := convert.Default.LookupOp(c.operation, from, to)
 	if !ok {
 		return nil, nil, fmt.Errorf("no converter for %s %s to %s", c.operation, from, to)
@@ -828,7 +853,7 @@ func (c *protocolClient) convert(ctx context.Context, from, to string, src []byt
 	}
 	convertCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	if err := conv.Convert(convertCtx, inPath, outPath, nil); err != nil {
+	if err := conv.Convert(convertCtx, inPath, outPath, opts); err != nil {
 		return nil, nil, err
 	}
 	primary, err := readLimitedJobFile(outPath, maxOut)
@@ -1041,7 +1066,7 @@ func (c *protocolClient) renewUntil(attempt context.Context, asgn assignmentJSON
 }
 
 func (c *protocolClient) renew(ctx context.Context, asgn assignmentJSON) (time.Time, controlJSON, error) {
-	body := []byte(`{"protocol_version":1}`)
+	body := []byte(protocolVersionBody)
 	raw, err := c.postCore(
 		ctx,
 		"/worker/v1/attempts/"+url.PathEscape(asgn.AttemptID)+"/lease",
@@ -1091,7 +1116,7 @@ func (c *protocolClient) postProgress(ctx context.Context, asgn assignmentJSON, 
 	if percent < 0 || percent > 99 {
 		return errors.New("progress")
 	}
-	body, err := json.Marshal(progressJSON{ProtocolVersion: 1, Percent: percent})
+	body, err := json.Marshal(progressJSON{ProtocolVersion: protocolVersion, Percent: percent})
 	if err != nil {
 		return err
 	}
@@ -1117,13 +1142,13 @@ func (c *protocolClient) fail(ctx context.Context, asgn assignmentJSON, code, me
 	if ctx.Err() != nil {
 		return nil
 	}
-	if code != "timeout" && code != "engine_error" {
+	if code != "timeout" && code != "engine_error" && code != "invalid_options" {
 		code = "engine_error"
 	}
 	if message == "" {
 		message = "conversion failed"
 	}
-	body, err := json.Marshal(failJSON{ProtocolVersion: 1, EngineCode: code, Message: message})
+	body, err := json.Marshal(failJSON{ProtocolVersion: protocolVersion, EngineCode: code, Message: message})
 	if err != nil {
 		return err
 	}
@@ -1153,7 +1178,7 @@ func (c *protocolClient) postStopped(ctx context.Context, asgn assignmentJSON, r
 	}
 	notify, cancel := context.WithTimeout(ctx, stoppedNotifyTimeout)
 	defer cancel()
-	body, err := json.Marshal(stoppedJSON{ProtocolVersion: 1, Reason: reason})
+	body, err := json.Marshal(stoppedJSON{ProtocolVersion: protocolVersion, Reason: reason})
 	if err != nil {
 		return err
 	}

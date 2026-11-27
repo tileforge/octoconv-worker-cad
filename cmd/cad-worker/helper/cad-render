@@ -15,22 +15,25 @@ VIEWS = {
     "top": ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
     "bottom": ((0.0, 0.0, -1.0), (0.0, -1.0, 0.0)),
 }
-FILL = (0.94, 0.91, 0.84)
-EDGE = (0.08, 0.08, 0.10)
 FEATURE_ANGLE = 30.0
 CAMERA_DISTANCE = 2.0
 MARGIN = 0.06
-LIGHTS = (
-    ((-0.5, -1.0, 1.5), 0.80),
-    ((1.0, 0.5, 0.7), 0.40),
-    ((0.0, 1.0, -1.0), 0.25),
-)
-# Glancing studio lights add soft reflection bands along curved surfaces.
-REFLECTION_LIGHTS = (
-    ((-0.577, 0.071, 0.815), 0.08),
-    ((-0.577, -0.740, 0.346), 0.10),
-    ((-0.577, -0.668, -0.468), 0.08),
-)
+METALS = {
+    "steel": (0.55, 0.57, 0.61),
+    "aluminum": (0.77, 0.79, 0.82),
+    "copper": (0.92, 0.55, 0.37),
+}
+COLORS = {
+    "blue": (0.10, 0.33, 0.64),
+    "black": (0.075, 0.082, 0.09),
+}
+# Metal contribution and microfacet roughness for each surface treatment.
+FINISHES = {
+    "bare": (0.90, 0.32),
+    "polished": (0.98, 0.15),
+    "anodized": (0.76, 0.36),
+    "matte_powder_coat": (0.0, 0.83),
+}
 MIN_SIZE = 256
 MAX_SIZE = 2048
 EXIT_RENDER = 1
@@ -62,91 +65,112 @@ def unit(a):
     return [x / n for x in a]
 
 
-def silhouette_edges(points, triangles, direction):
+def studio_environment():
+    """A small linear-light panorama of a photographic studio, generated in memory."""
     import numpy as np
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+    from vtkmodules.vtkCommonDataModel import vtkImageData
+    from vtkmodules.vtkRenderingCore import vtkTexture
 
-    points = np.asarray(points, dtype=np.float64)
-    triangles = np.asarray(triangles, dtype=np.int64)
-    direction = np.asarray(direction, dtype=np.float64)
-    empty = np.empty((0, 2), dtype=np.int64)
-    if triangles.size == 0 or points.size == 0:
-        return empty
-    span = np.max(points, axis=0) - np.min(points, axis=0)
-    scale = float(np.dot(span, span))
-    if not scale > 0.0:
-        return empty
-    a = points[triangles[:, 0]]
-    b = points[triangles[:, 1]]
-    c = points[triangles[:, 2]]
-    normal = np.cross(b - a, c - a)
-    valid = np.linalg.norm(normal, axis=1) > 1e-12 * scale
-    if not np.any(valid):
-        return empty
-    front = np.zeros(triangles.shape[0], dtype=bool)
-    front[valid] = normal[valid] @ direction > 0
-    tris = triangles[valid]
-    side = front[valid]
-    pairs = np.sort(np.stack((tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]), axis=1), axis=2)
-    pairs = pairs.reshape(-1, 2)
-    sides = np.repeat(side, 3)
-    keys = pairs[:, 0] * np.int64(points.shape[0]) + pairs[:, 1]
-    order = np.argsort(keys, kind="mergesort")
-    keys = keys[order]
-    pairs = pairs[order]
-    sides = sides[order]
-    cuts = np.flatnonzero(keys[1:] != keys[:-1]) + 1
-    starts = np.empty(cuts.size + 1, dtype=np.int64)
-    starts[0] = 0
-    starts[1:] = cuts
-    counts = np.diff(np.append(starts, len(keys)))
-    front_count = np.add.reduceat(sides.astype(np.int64), starts)
-    keep = (front_count > 0) & (front_count < counts)
-    return pairs[starts[keep]]
+    width, height = 256, 128
+    latitude = (np.arange(height)[:, None] + 0.5) * math.pi / height - math.pi / 2
+    longitude = (np.arange(width)[None, :] + 0.5) * math.tau / width - math.pi
+    radiance = np.broadcast_to(0.12 + 0.15 * np.sin(latitude) ** 2, (height, width)).copy()
+    # Broad panels and a narrow strip leave distinct reflections on bends and chamfers.
+    for azimuth, elevation, half_width, half_height, intensity in (
+        (-1.0, 0.70, 0.86, 0.44, 2.8),
+        (1.65, 0.25, 0.28, 0.82, 2.0),
+        (2.95, -0.55, 0.95, 0.28, 0.9),
+    ):
+        dx = (longitude - azimuth + math.pi) % math.tau - math.pi
+        dy = latitude - elevation
+        radiance += intensity * np.exp(-((dx / half_width) ** 4 + (dy / half_height) ** 4))
+    # A mirror-like plane can reflect a whole panel straight at the camera.
+    # Roll off panel highlights before storing them in the white-background PNG.
+    knee = 0.48
+    excess = np.maximum(radiance - knee, 0.0)
+    radiance = np.minimum(radiance, knee) + 0.42 * (1.0 - np.exp(-excess / 0.42))
+    rgb = np.repeat(radiance.astype(np.float32).reshape(-1, 1), 3, axis=1)
+    image = vtkImageData()
+    image.SetDimensions(width, height, 1)
+    image.GetPointData().SetScalars(numpy_to_vtk(rgb, deep=True))
+    texture = vtkTexture()
+    texture.SetColorModeToDirectScalars()
+    texture.SetInputData(image)
+    texture.InterpolateOn()
+    texture.MipmapOn()
+    return texture
 
 
-def consistent_surface(poly):
-    from vtkmodules.vtkFiltersCore import vtkPolyDataNormals
+def anodized_grain(poly, prop, spans, center, diag):
+    """Vary microfacet roughness in fine strokes along the part's longest axis."""
+    import numpy as np
+    from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+    from vtkmodules.vtkCommonDataModel import vtkImageData
+    from vtkmodules.vtkRenderingCore import vtkTexture
 
-    normals = vtkPolyDataNormals()
-    normals.SetInputData(poly)
-    normals.ConsistencyOn()
-    normals.SplittingOff()
-    normals.AutoOrientNormalsOff()
-    normals.NonManifoldTraversalOn()
-    normals.ComputePointNormalsOff()
-    normals.ComputeCellNormalsOn()
-    normals.Update()
-    return normals.GetOutput()
-
-
-def silhouette_lines(poly, direction):
-    from vtkmodules.util.numpy_support import vtk_to_numpy
-    from vtkmodules.vtkCommonCore import vtkPoints
-    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-
-    poly = consistent_surface(poly)
-    polys = poly.GetPolys()
-    if polys.GetNumberOfCells() == 0 or poly.GetNumberOfPoints() == 0:
-        return None
-    offsets = vtk_to_numpy(polys.GetOffsetsArray())
-    if offsets.size < 2 or not (offsets[1:] - offsets[:-1] == 3).all():
-        return None
     points = vtk_to_numpy(poly.GetPoints().GetData())
-    triangles = vtk_to_numpy(polys.GetConnectivityArray()).reshape(-1, 3)
-    edges = silhouette_edges(points, triangles, direction)
-    if edges.size == 0:
-        return None
-    lines = vtkCellArray()
-    for a, b in edges:
-        lines.InsertNextCell(2)
-        lines.InsertCellPoint(int(a))
-        lines.InsertCellPoint(int(b))
-    copied = vtkPoints()
-    copied.DeepCopy(poly.GetPoints())
-    out = vtkPolyData()
-    out.SetPoints(copied)
-    out.SetLines(lines)
-    return out
+    across, depth, _ = sorted(range(3), key=spans.__getitem__)
+    uv = np.zeros((len(points), 2), dtype=np.float32)
+    uv[:, 0] = ((points[:, depth] - center[depth]) +
+                0.31 * (points[:, across] - center[across])) * (2.0 / diag)
+    poly.GetPointData().SetTCoords(numpy_to_vtk(uv, deep=True))
+
+    # The ORM green channel scales roughness. Mipmaps average grain that
+    # would otherwise flicker as the output resolution changes.
+    rng = np.random.default_rng(7)
+    pixels = np.full((256, 3), 255, dtype=np.uint8)
+    pixels[:, 1] = rng.integers(145, 256, size=256, dtype=np.uint8)
+    strip = vtkImageData()
+    strip.SetDimensions(256, 2, 1)
+    strip.GetPointData().SetScalars(numpy_to_vtk(np.tile(pixels, (2, 1)), deep=True))
+    texture = vtkTexture()
+    texture.SetColorModeToDirectScalars()
+    texture.SetInputData(strip)
+    texture.RepeatOn()
+    texture.InterpolateOn()
+    texture.MipmapOn()
+    prop.SetORMTexture(texture)
+
+
+def subpixel_profile(poly, right, up, pixel_width):
+    """Test the projected mesh width across its long axis, including tilted sheets."""
+    import numpy as np
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    points = vtk_to_numpy(poly.GetPoints().GetData())
+    screen = np.asarray((right, up)).T
+
+    def cross_axis(projected):
+        axis = np.ptp(projected, axis=0).argmax()
+        chord = projected[projected[:, axis].argmax()] - projected[projected[:, axis].argmin()]
+        length = math.hypot(*chord)
+        return np.array([-chord[1], chord[0]]) / length if length else None
+
+    # Ordinary solids can be ruled out with a few dozen vertices. For a
+    # candidate profile, check its full width in bounded batches.
+    sample = points[::max(1, len(points) // 64)] @ screen
+    normal = cross_axis(sample)
+    if normal is not None and np.ptp(sample @ normal) > 2 * pixel_width:
+        return False
+    if normal is None:
+        # The sample can land on repeated coordinates of a disconnected mesh.
+        # Include its anchor while looking for the first visible direction.
+        for start in range(0, len(points), 65536):
+            block = points[start:start + 65536] @ screen
+            normal = cross_axis(np.vstack((sample[:1], block)))
+            if normal is not None:
+                break
+        else:
+            return True
+    direction = screen @ normal
+    low, high = math.inf, -math.inf
+    for start in range(0, len(points), 65536):
+        offsets = points[start:start + 65536] @ direction
+        low, high = min(low, offsets.min()), max(high, offsets.max())
+        if high - low >= pixel_width:
+            return False
+    return True
 
 
 def verdict(fd, args, verdict_name, reason, triangles=0, extra=None):
@@ -166,7 +190,7 @@ def verdict(fd, args, verdict_name, reason, triangles=0, extra=None):
 
 def render(fd, args):
     from vtkmodules.vtkCommonCore import vtkObject
-    from vtkmodules.vtkFiltersCore import vtkCleanPolyData, vtkFeatureEdges, vtkPolyDataNormals
+    from vtkmodules.vtkFiltersCore import vtkCleanPolyData, vtkPolyDataNormals
     from vtkmodules.vtkIOGeometry import vtkSTLReader
     from vtkmodules.vtkIOImage import vtkPNGWriter
     from vtkmodules.vtkRenderingCore import (
@@ -202,6 +226,9 @@ def render(fd, args):
     half_h = max(abs(dot(sub(c, center), up)) for c in corners)
     long_half = max(half_w, half_h)
     short_half = min(half_w, half_h)
+    if long_half == 0.0:
+        verdict(fd, args, "empty", "zero_projected_extent", triangles)
+        return EXIT_EXTENT
     scale = long_half / (1.0 - 2.0 * MARGIN)
 
     clean = vtkCleanPolyData()
@@ -213,48 +240,31 @@ def render(fd, args):
     normals.SetFeatureAngle(FEATURE_ANGLE)
     normals.SplittingOn()
 
-    edges = vtkFeatureEdges()
-    edges.SetInputConnection(clean.GetOutputPort())
-    edges.BoundaryEdgesOn()
-    edges.FeatureEdgesOn()
-    edges.NonManifoldEdgesOn()
-    edges.ManifoldEdgesOff()
-    edges.SetFeatureAngle(FEATURE_ANGLE)
-    edges.ColoringOff()
-
-    surf_mapper = vtkPolyDataMapper()
-    surf_mapper.SetInputConnection(normals.GetOutputPort())
-    surf_mapper.SetResolveCoincidentTopologyToPolygonOffset()
+    mapper = vtkPolyDataMapper()
+    mapper.SetInputConnection(normals.GetOutputPort())
     surf = vtkActor()
-    surf.SetMapper(surf_mapper)
-    surf.GetProperty().SetColor(*FILL)
-    surf.GetProperty().SetAmbient(0.48)
-    surf.GetProperty().SetDiffuse(0.45)
-    surf.GetProperty().SetInterpolationToPhong()
-    surf.GetProperty().SetSpecular(0.65)
-    surf.GetProperty().SetSpecularPower(48.0)
+    surf.SetMapper(mapper)
+    prop = surf.GetProperty()
+    metallic, roughness = FINISHES[args.finish]
+    tint = METALS[args.material]
+    if args.finish == "matte_powder_coat":
+        tint = COLORS.get(args.color, (0.53, 0.54, 0.55))
+    elif args.color != "natural":
+        tint = tuple(metal * dye for metal, dye in zip(tint, COLORS[args.color]))
+    prop.SetInterpolationToPBR()
+    prop.SetColor(*tint)
+    prop.SetMetallic(metallic)
+    prop.SetRoughness(roughness)
+    if args.finish == "anodized":
+        anodized_grain(clean.GetOutput(), prop, (x1 - x0, y1 - y0, z1 - z0), center, diag)
 
-    edge_mapper = vtkPolyDataMapper()
-    edge_mapper.SetInputConnection(edges.GetOutputPort())
-    edge_mapper.ScalarVisibilityOff()
-    edge = vtkActor()
-    edge.SetMapper(edge_mapper)
-    edge.GetProperty().SetColor(*EDGE)
-    # FXAA blends one-pixel edges into the bright fill at small frame sizes.
-    # Keep a dark edge core without changing the material or studio lighting.
-    edge.GetProperty().SetLineWidth(max(2.0, args.size / 640.0))
-    edge.GetProperty().LightingOff()
-
-    outline = silhouette_lines(clean.GetOutput(), direction)
-    outline_actor = None
-    if outline is not None:
-        outline_mapper = vtkPolyDataMapper()
-        outline_mapper.SetInputData(outline)
-        outline_actor = vtkActor()
-        outline_actor.SetMapper(outline_mapper)
-        outline_actor.GetProperty().SetColor(*EDGE)
-        outline_actor.GetProperty().SetLineWidth(edge.GetProperty().GetLineWidth())
-        outline_actor.GetProperty().LightingOff()
+    # An edge-on sheet can project to less than a pixel. Draw its profile
+    # in the surface colour so that orthographic views still show the part.
+    pixel_width = 2.0 * scale / args.size
+    if 2.0 * short_half < pixel_width or subpixel_profile(poly, right, up, pixel_width):
+        prop.SetRepresentationToWireframe()
+        prop.LightingOff()
+        prop.SetLineWidth(2.0)
 
     transparent = args.background == "transparent"
     renderer = vtkRenderer()
@@ -262,16 +272,27 @@ def render(fd, args):
     renderer.SetBackgroundAlpha(0.0 if transparent else 1.0)
     renderer.AutomaticLightCreationOff()
     renderer.AddActor(surf)
-    renderer.AddActor(edge)
-    if outline_actor is not None:
-        renderer.AddActor(outline_actor)
-    for vec, intensity in LIGHTS + REFLECTION_LIGHTS:
+    renderer.UseImageBasedLightingOn()
+    renderer.SetEnvironmentTexture(studio_environment())
+    key = vtkLight()
+    key.SetLightTypeToCameraLight()
+    key.SetPosition(-0.6, 0.8, 1.0)
+    key.SetFocalPoint(0.0, 0.0, 0.0)
+    key.SetIntensity(0.62)
+    renderer.AddLight(key)
+    # Finite-distance lamps give even broad flat sheet faces a moving highlight.
+    # Scale their positions with the part so mm and inch models light identically.
+    for offset, intensity in (((-0.48, 0.48, 0.48), 1.0),
+                              ((-0.52, -0.55, -0.42), 0.6)):
         light = vtkLight()
         light.SetLightTypeToSceneLight()
-        light.SetPositional(False)
+        light.PositionalOn()
+        light.SetConeAngle(180.0)
+        light.SetPosition(*[c + d * diag for c, d in zip(center, offset)])
         light.SetFocalPoint(*center)
-        light.SetPosition(*[c + v * diag for c, v in zip(center, unit(vec))])
-        light.SetIntensity(intensity)
+        # A point lamp concentrates its energy into a very small highlight
+        # on polished metal. Limit its peak so holes stay visible on white.
+        light.SetIntensity(intensity * min(0.4, 4 * roughness ** 4))
         renderer.AddLight(light)
     renderer.UseFXAAOn()
 
@@ -327,6 +348,9 @@ def main():
     ap.add_argument("--view", default="iso", choices=sorted(VIEWS))
     ap.add_argument("--size", type=int, default=1280)
     ap.add_argument("--background", default="opaque", choices=("opaque", "transparent"))
+    ap.add_argument("--material", default="steel", choices=sorted(METALS))
+    ap.add_argument("--color", default="natural", choices=("natural", *COLORS))
+    ap.add_argument("--finish", default="bare", choices=sorted(FINISHES))
     ap.add_argument("src")
     ap.add_argument("dst")
     args = ap.parse_args()

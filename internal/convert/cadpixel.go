@@ -12,18 +12,19 @@ import (
 )
 
 const (
-	cadPixelMaxBytes       = 96 << 20
-	cadBackgroundCutoff    = 250
-	cadDarkCutoff          = 80
-	cadBlobFracMin         = 0.02
-	cadBlobFracMax         = 0.90
-	cadBlobDarkMin         = 0.001
-	cadThinAspectMax       = 0.15
-	cadThinDarkPerLongSide = 0.25
-	cadExtentMin           = 0.50
-	cadMarginMin           = 0.03
-	cadDrawingSpanMin      = 0.5
-	cadLetterboxSlack      = 2
+	cadPixelMaxBytes          = 96 << 20
+	cadBackgroundCutoff       = 250
+	cadDarkCutoff             = 80
+	cadSurfaceMinContrast     = 20 // 8-bit luma difference from the white background
+	cadBlobFracMin            = 0.02
+	cadBlobFracMax            = 0.90
+	cadBlobSurfaceMin         = 0.001
+	cadThinAspectMax          = 0.15
+	cadThinSurfacePerLongSide = 0.25
+	cadExtentMin              = 0.50
+	cadMarginMin              = 0.03
+	cadDrawingSpanMin         = 0.5
+	cadLetterboxSlack         = 2
 
 	CADDXFInkSize       = CADMaxRenderSize
 	CADInkChannelCutoff = cadBackgroundCutoff
@@ -71,8 +72,9 @@ func JudgeCADPNG(r io.Reader, size int, background string) (CADPixelFacts, error
 	if err != nil {
 		return facts, err
 	}
-	cadMeasure(img, &facts)
-	return facts, cadJudgeFacts(&facts, size, background)
+	profile := cadProfile{rows: make([]cadScanline, size), visibleColumns: make([]bool, size)}
+	_, surfacePx := cadMeasure(img, &facts, &profile)
+	return facts, cadJudgeFacts(&facts, size, background, surfacePx, &profile)
 }
 
 func cadReadFrame(r io.Reader, size int, background string, facts *CADPixelFacts) (image.Image, error) {
@@ -130,7 +132,7 @@ func JudgeCADDrawingPNG(r io.Reader, size int, background string, box CADLetterb
 	if err != nil {
 		return facts, err
 	}
-	cadMeasure(img, &facts)
+	cadMeasure(img, &facts, nil)
 	if !cadDrawingInk(&facts) {
 		return facts, fmt.Errorf("%w: J1 the frame holds no ink", ErrCADRenderRejected)
 	}
@@ -159,7 +161,7 @@ func JudgeCADDrawingInk(r io.Reader, size int) (CADPixelFacts, error) {
 	if err != nil {
 		return facts, fmt.Errorf("%w: the ink check frame: %v", ErrCADDrawingFailed, err)
 	}
-	if opaquePx := cadMeasure(img, &facts); opaquePx != size*size {
+	if opaquePx, _ := cadMeasure(img, &facts, nil); opaquePx != size*size {
 		return facts, fmt.Errorf("%w: the ink check frame has %d of %d pixels not opaque, want a white page", ErrCADDrawingFailed, size*size-opaquePx, size*size)
 	}
 	if !cadDrawingInk(&facts) {
@@ -172,11 +174,21 @@ func cadOnWhite(c, a uint8) uint8 {
 	return uint8((int(c)*int(a) + 255*(255-int(a)) + 127) / 255)
 }
 
-func cadMeasure(img image.Image, f *CADPixelFacts) int {
+type cadScanline struct {
+	left, right int // half-open bounds of foreground pixels
+}
+
+type cadProfile struct {
+	rows           []cadScanline
+	visibleColumns []bool
+	visibleRows    int
+}
+
+func cadMeasure(img image.Image, f *CADPixelFacts, profile *cadProfile) (opaquePx, surfacePx int) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	x0, y0, x1, y1 := w, h, -1, -1
-	transparentPx, opaquePx, ring := 0, 0, 0
+	transparentPx, ring := 0, 0
 	nrgba, _ := img.(*image.NRGBA)
 	var rows, white []byte
 	var stride, base int
@@ -202,6 +214,7 @@ func cadMeasure(img image.Image, f *CADPixelFacts) int {
 				continue
 			}
 		}
+		left, right, previousSurface := w, 0, surfacePx
 		for x := 0; x < w; x++ {
 			var r, g, bl, a uint8
 			if nrgba != nil {
@@ -227,20 +240,25 @@ func cadMeasure(img image.Image, f *CADPixelFacts) int {
 				continue
 			}
 			f.Count++
+			if luma, _, _ := color.RGBToYCbCr(r, g, bl); 255-luma >= cadSurfaceMinContrast {
+				surfacePx++
+				if profile != nil {
+					profile.visibleColumns[x] = true
+				}
+			}
 			if r < cadDarkCutoff && g < cadDarkCutoff && bl < cadDarkCutoff {
 				f.DarkCount++
 			}
-			if x < x0 {
-				x0 = x
-			}
-			if x > x1 {
-				x1 = x
-			}
-			if y < y0 {
-				y0 = y
-			}
-			if y > y1 {
-				y1 = y
+			left, right = min(left, x), x+1
+		}
+		if right > left {
+			x0, x1 = min(x0, left), max(x1, right-1)
+			y0, y1 = min(y0, y), y
+			if profile != nil {
+				profile.rows[y] = cadScanline{left, right}
+				if surfacePx > previousSurface {
+					profile.visibleRows++
+				}
 			}
 		}
 	}
@@ -255,7 +273,7 @@ func cadMeasure(img image.Image, f *CADPixelFacts) int {
 		f.BoxX, f.BoxY = x0, y0
 		f.Margin = min(x0, y0, w-1-x1, h-1-y1)
 	}
-	return opaquePx
+	return opaquePx, surfacePx
 }
 
 func cadJudgeAlpha(f *CADPixelFacts, background string) error {
@@ -274,28 +292,68 @@ func cadJudgeAlpha(f *CADPixelFacts, background string) error {
 	return nil
 }
 
-func cadJudgeFacts(f *CADPixelFacts, size int, background string) error {
+func (p *cadProfile) isDiagonal(f *CADPixelFacts, surfacePx int, minLength float64) bool {
+	rows := p.rows[f.BoxY : f.BoxY+f.BoxH]
+	// The first and last occupied row centers give the direction of an edge-on sheet.
+	first, last := rows[0], rows[len(rows)-1]
+	dx := float64(last.left+last.right-first.left-first.right) / 2
+	dy := float64(len(rows) - 1)
+	distance := math.Hypot(dx, dy)
+	length := distance + 1
+	if length < minLength || float64(surfacePx) < cadThinSurfacePerLongSide*length {
+		return false
+	}
+	// Two dense endpoints can supply enough pixels while leaving the profile empty in between.
+	visibleColumns := 0
+	for _, visible := range p.visibleColumns[f.BoxX : f.BoxX+f.BoxW] {
+		if visible {
+			visibleColumns++
+		}
+	}
+	if float64(p.visibleRows) < cadThinSurfacePerLongSide*float64(f.BoxH) ||
+		float64(visibleColumns) < cadThinSurfacePerLongSide*float64(f.BoxW) {
+		return false
+	}
+	// Project row endpoints onto the perpendicular to measure the full strip width.
+	low, high := math.Inf(1), math.Inf(-1)
+	for y, row := range rows {
+		if row.right <= row.left {
+			continue
+		}
+		low = min(low, dy*float64(row.left)-dx*float64(y))
+		high = max(high, dy*float64(row.right-1)-dx*float64(y))
+	}
+	width := (high-low)/distance + 1
+	return width < cadThinAspectMax*length
+}
+
+func cadJudgeFacts(f *CADPixelFacts, size int, background string, surfacePx int, profile *cadProfile) error {
 	if f.Count == 0 {
 		return fmt.Errorf("%w: J1 the frame holds no part pixels", ErrCADRenderRejected)
 	}
 	long, short := max(f.BoxW, f.BoxH), min(f.BoxW, f.BoxH)
-	if float64(long) < cadExtentMin*float64(size) {
+	aspect := float64(short) / float64(long)
+	minLength := cadExtentMin * float64(size)
+	diagonal := f.Frac < cadBlobFracMin && aspect >= cadThinAspectMax &&
+		float64(surfacePx) >= cadThinSurfacePerLongSide*float64(long) &&
+		profile.isDiagonal(f, surfacePx, minLength)
+	if float64(long) < minLength && !diagonal {
 		return fmt.Errorf("%w: J2 the long side is %d px of a %d px frame", ErrCADRenderRejected, long, size)
 	}
 	if need := int(cadMarginMin * float64(size)); f.Margin < need {
 		return fmt.Errorf("%w: J3 the margin is %d px, want at least %d", ErrCADRenderRejected, f.Margin, need)
 	}
-	aspect := float64(short) / float64(long)
+	surfaceFrac := float64(surfacePx) / float64(size*size)
 	switch {
-	case f.Frac >= cadBlobFracMin && f.Frac <= cadBlobFracMax && f.Dark >= cadBlobDarkMin:
+	case f.Frac >= cadBlobFracMin && f.Frac <= cadBlobFracMax && surfaceFrac >= cadBlobSurfaceMin:
 		if f.Count < long {
 			return fmt.Errorf("%w: J1 %d part pixels cannot span a %d px extent", ErrCADRenderRejected, f.Count, long)
 		}
 		f.Mode = "blob"
-	case aspect < cadThinAspectMax && float64(f.DarkCount) >= cadThinDarkPerLongSide*float64(long):
+	case diagonal || (aspect < cadThinAspectMax && float64(surfacePx) >= cadThinSurfacePerLongSide*float64(long)):
 		f.Mode = "thin"
 	default:
-		return fmt.Errorf("%w: J4 neither a blob (frac %.4f, dark %.4f) nor a thin part (aspect %.4f, %d dark pixels)", ErrCADRenderRejected, f.Frac, f.Dark, aspect, f.DarkCount)
+		return fmt.Errorf("%w: J4 neither a blob (frac %.4f, visible surface %.4f) nor a thin part (aspect %.4f, %d visible surface pixels)", ErrCADRenderRejected, f.Frac, surfaceFrac, aspect, surfacePx)
 	}
 	return cadJudgeAlpha(f, background)
 }
